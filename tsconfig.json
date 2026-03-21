@@ -1,0 +1,8 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./convex" },
+    { "path": "./packages/contracts" },
+    { "path": "./apps/api" }
+  ]
+}
