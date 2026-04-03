@@ -1,0 +1,755 @@
+import type {
+  LobbyPayload,
+  MatchHitZone,
+  MatchMapId,
+  MatchPlayerRealtimeStatePayload,
+  MatchPlayerStatePayload,
+  MatchStatePayload,
+  ShotFiredPayload,
+} from "./domain.js";
+import { HttpError } from "./errors.js";
+
+const MATCH_MAP_ID: MatchMapId = "map1";
+const MATCH_MAX_HEALTH = 100;
+const MATCH_MAX_MAG_AMMO = 30;
+const MATCH_FIRE_INTERVAL_MS = 130;
+const MATCH_RELOAD_MS = 3_000;
+const MATCH_RESPAWN_MS = 3_000;
+const MAX_POSITION_STEP_METERS = 1.25;
+const MAX_SPEED_MPS = 12;
+const PLAYER_BLOCKER_MARGIN = 0.2;
+const WORLD_Y_MIN = -2;
+const WORLD_Y_MAX = 8;
+
+type MatchSpawnSlot = MatchPlayerStatePayload["spawnSlot"];
+
+type MatchPlayerPoseState = Omit<MatchPlayerRealtimeStatePayload, "userId" | "alive"> & {
+  updatedAtMs: number;
+};
+
+type MatchPlayerRuntime = {
+  userId: string;
+  spawnSlot: MatchSpawnSlot;
+  pose: MatchPlayerPoseState;
+  health: number;
+  alive: boolean;
+  respawnAtMs: number | null;
+  magAmmo: number;
+  reloadingUntilMs: number | null;
+  lastShotAtMs: number | null;
+};
+
+type MatchRuntime = {
+  code: string;
+  startedAt: string;
+  mapId: MatchMapId;
+  players: Map<string, MatchPlayerRuntime>;
+};
+
+type Point3 = {
+  x: number;
+  y: number;
+  z: number;
+};
+
+type BlockingVolume = {
+  center: [number, number, number];
+  size: [number, number, number];
+};
+
+type WorldBounds = {
+  minX: number;
+  maxX: number;
+  minZ: number;
+  maxZ: number;
+};
+
+export type IncomingPlayerState = Omit<MatchPlayerRealtimeStatePayload, "userId" | "alive">;
+
+export type MatchRuntimeOutcome = {
+  matchState: MatchStatePayload | null;
+  playerStates: MatchPlayerRealtimeStatePayload[];
+  shotFired: ShotFiredPayload | null;
+};
+
+export type MatchRuntimeManager = {
+  createMatch: (code: string, lobby: LobbyPayload) => MatchStatePayload;
+  destroyMatch: (code: string) => void;
+  destroyAll: () => void;
+  getMatchState: (code: string) => MatchStatePayload | null;
+  getPlayerStates: (code: string) => MatchPlayerRealtimeStatePayload[];
+  handlePlayerState: (
+    code: string,
+    userId: string,
+    state: IncomingPlayerState,
+    now: Date,
+  ) => MatchRuntimeOutcome;
+  handleFire: (
+    code: string,
+    userId: string,
+    shotId: string,
+    weaponType: "rifle",
+    now: Date,
+  ) => MatchRuntimeOutcome;
+  handleReload: (code: string, userId: string, now: Date) => MatchRuntimeOutcome;
+};
+
+function wall(
+  cx: number,
+  cz: number,
+  sx: number,
+  sz: number,
+  h = 3.8,
+): BlockingVolume {
+  return { center: [cx, h / 2, cz], size: [sx, h, sz] };
+}
+
+function crate(
+  cx: number,
+  cz: number,
+  sx: number,
+  sz: number,
+  h = 2.6,
+): BlockingVolume {
+  return { center: [cx, h / 2, cz], size: [sx, h, sz] };
+}
+
+const MAP1_WORLD_BOUNDS: WorldBounds = {
+  minX: -41.85,
+  maxX: 41.85,
+  minZ: -54.85,
+  maxZ: 54.85,
+};
+
+const MAP1_BLOCKERS: readonly BlockingVolume[] = [
+  wall(0, -55, 84, 0.3),
+  wall(0, 55, 84, 0.3),
+  wall(-42, 0, 0.3, 110),
+  wall(42, 0, 0.3, 110),
+  wall(0, -33, 40, 0.3),
+  wall(0, 33, 40, 0.3),
+  wall(-14, -18, 20, 0.3),
+  wall(14, -18, 20, 0.3),
+  wall(-14, 18, 20, 0.3),
+  wall(14, 18, 20, 0.3),
+  wall(-24, -11, 0.3, 14),
+  wall(-24, 11, 0.3, 14),
+  wall(24, -11, 0.3, 14),
+  wall(24, 11, 0.3, 14),
+  {
+    center: [0, 3.95, 0],
+    size: [48, 0.3, 36],
+  },
+  crate(-12, -6, 6, 6),
+  crate(12, 6, 6, 6),
+  crate(-33, -24, 5, 5),
+  crate(33, -24, 5, 5),
+  crate(-33, 24, 5, 5),
+  crate(33, 24, 5, 5),
+];
+
+const MAP1_SPAWNS = {
+  host: {
+    position: [0, 0.5, -50] as [number, number, number],
+    yaw: Math.PI,
+    pitch: -0.05,
+  },
+  guest: {
+    position: [0, 0.5, 50] as [number, number, number],
+    yaw: 0,
+    pitch: -0.05,
+  },
+} satisfies Record<MatchSpawnSlot, {
+  position: [number, number, number];
+  yaw: number;
+  pitch: number;
+}>;
+
+function clamp01(value: number) {
+  return Math.max(0, Math.min(1, value));
+}
+
+function toIso(ms: number) {
+  return new Date(ms).toISOString();
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function normalizeAngleRadians(value: number) {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  const twoPi = Math.PI * 2;
+  let normalized = value % twoPi;
+  if (normalized > Math.PI) {
+    normalized -= twoPi;
+  } else if (normalized < -Math.PI) {
+    normalized += twoPi;
+  }
+  return normalized;
+}
+
+function createSpawnPose(spawnSlot: MatchSpawnSlot, updatedAtMs: number): MatchPlayerPoseState {
+  const spawn = MAP1_SPAWNS[spawnSlot];
+  return {
+    seq: 0,
+    x: spawn.position[0],
+    y: spawn.position[1],
+    z: spawn.position[2],
+    yaw: spawn.yaw,
+    pitch: spawn.pitch,
+    moving: false,
+    sprinting: false,
+    crouched: false,
+    grounded: true,
+    ads: false,
+    updatedAtMs,
+  };
+}
+
+function buildRealtimePlayerState(player: MatchPlayerRuntime): MatchPlayerRealtimeStatePayload {
+  return {
+    userId: player.userId,
+    seq: player.pose.seq,
+    x: player.pose.x,
+    y: player.pose.y,
+    z: player.pose.z,
+    yaw: player.pose.yaw,
+    pitch: player.pose.pitch,
+    moving: player.pose.moving,
+    sprinting: player.pose.sprinting,
+    crouched: player.pose.crouched,
+    grounded: player.pose.grounded,
+    ads: player.pose.ads,
+    alive: player.alive,
+  };
+}
+
+function buildMatchPlayerState(player: MatchPlayerRuntime): MatchPlayerStatePayload {
+  return {
+    userId: player.userId,
+    spawnSlot: player.spawnSlot,
+    health: player.health,
+    alive: player.alive,
+    respawnAt: player.respawnAtMs === null ? null : toIso(player.respawnAtMs),
+    magAmmo: player.magAmmo,
+    reloadingUntil: player.reloadingUntilMs === null ? null : toIso(player.reloadingUntilMs),
+  };
+}
+
+function buildMatchState(match: MatchRuntime): MatchStatePayload {
+  return {
+    startedAt: match.startedAt,
+    mapId: match.mapId,
+    players: [...match.players.values()]
+      .sort((left, right) => left.spawnSlot.localeCompare(right.spawnSlot))
+      .map(buildMatchPlayerState),
+  };
+}
+
+function buildPoint(x: number, y: number, z: number): Point3 {
+  return { x, y, z };
+}
+
+function subtractPoint(left: Point3, right: Point3): Point3 {
+  return {
+    x: left.x - right.x,
+    y: left.y - right.y,
+    z: left.z - right.z,
+  };
+}
+
+function pointLength(point: Point3) {
+  return Math.sqrt(point.x * point.x + point.y * point.y + point.z * point.z);
+}
+
+function normalizePoint(point: Point3): Point3 {
+  const length = pointLength(point);
+  if (length <= 0.0001) {
+    return { x: 0, y: 0, z: -1 };
+  }
+
+  return {
+    x: point.x / length,
+    y: point.y / length,
+    z: point.z / length,
+  };
+}
+
+function distanceBetween(a: Point3, b: Point3) {
+  return pointLength(subtractPoint(a, b));
+}
+
+function directionFromYawPitch(yaw: number, pitch: number): Point3 {
+  const clampedPitch = Math.max(-1.5, Math.min(0.85, pitch));
+  const cosPitch = Math.cos(clampedPitch);
+  return normalizePoint({
+    x: -Math.sin(yaw) * cosPitch,
+    y: Math.sin(clampedPitch),
+    z: -Math.cos(yaw) * cosPitch,
+  });
+}
+
+function intersectRaySphere(
+  origin: Point3,
+  direction: Point3,
+  center: Point3,
+  radius: number,
+): number | null {
+  const oc = subtractPoint(origin, center);
+  const b = oc.x * direction.x + oc.y * direction.y + oc.z * direction.z;
+  const c = oc.x * oc.x + oc.y * oc.y + oc.z * oc.z - radius * radius;
+  const discriminant = b * b - c;
+  if (discriminant < 0) {
+    return null;
+  }
+
+  const sqrtDiscriminant = Math.sqrt(discriminant);
+  const near = -b - sqrtDiscriminant;
+  if (near >= 0) {
+    return near;
+  }
+  const far = -b + sqrtDiscriminant;
+  return far >= 0 ? far : null;
+}
+
+function intersectRayAabb(
+  origin: Point3,
+  direction: Point3,
+  blocker: BlockingVolume,
+): number | null {
+  const [cx, cy, cz] = blocker.center;
+  const [sx, sy, sz] = blocker.size;
+  const minX = cx - sx / 2;
+  const maxX = cx + sx / 2;
+  const minY = cy - sy / 2;
+  const maxY = cy + sy / 2;
+  const minZ = cz - sz / 2;
+  const maxZ = cz + sz / 2;
+
+  let tMin = 0;
+  let tMax = Number.POSITIVE_INFINITY;
+  const axes: Array<["x" | "y" | "z", number, number]> = [
+    ["x", minX, maxX],
+    ["y", minY, maxY],
+    ["z", minZ, maxZ],
+  ];
+
+  for (const [axis, min, max] of axes) {
+    const originValue = origin[axis];
+    const directionValue = direction[axis];
+    if (Math.abs(directionValue) < 0.00001) {
+      if (originValue < min || originValue > max) {
+        return null;
+      }
+      continue;
+    }
+
+    const inv = 1 / directionValue;
+    let t1 = (min - originValue) * inv;
+    let t2 = (max - originValue) * inv;
+    if (t1 > t2) {
+      const swap = t1;
+      t1 = t2;
+      t2 = swap;
+    }
+    tMin = Math.max(tMin, t1);
+    tMax = Math.min(tMax, t2);
+    if (tMax < tMin) {
+      return null;
+    }
+  }
+
+  return tMin >= 0 ? tMin : tMax >= 0 ? tMax : null;
+}
+
+function pointInsideBlocker(point: Point3) {
+  return MAP1_BLOCKERS.some((blocker) => {
+    const [cx, cy, cz] = blocker.center;
+    const [sx, sy, sz] = blocker.size;
+    return point.x >= cx - sx / 2 + PLAYER_BLOCKER_MARGIN &&
+      point.x <= cx + sx / 2 - PLAYER_BLOCKER_MARGIN &&
+      point.y >= cy - sy / 2 &&
+      point.y <= cy + sy / 2 &&
+      point.z >= cz - sz / 2 + PLAYER_BLOCKER_MARGIN &&
+      point.z <= cz + sz / 2 - PLAYER_BLOCKER_MARGIN;
+  });
+}
+
+function validatePositionStep(previous: MatchPlayerPoseState, next: Point3, nowMs: number) {
+  const dtSeconds = Math.max(0.05, (nowMs - previous.updatedAtMs) / 1000);
+  const maxDistance = MAX_POSITION_STEP_METERS + MAX_SPEED_MPS * dtSeconds;
+  const actualDistance = distanceBetween(
+    buildPoint(previous.x, previous.y, previous.z),
+    next,
+  );
+  if (actualDistance > maxDistance) {
+    throw new HttpError(409, "Movement update rejected as an impossible teleport.");
+  }
+}
+
+function resolveEyeHeight(crouched: boolean) {
+  return crouched ? 1.08 : 1.4;
+}
+
+function resolveHitSpheres(target: MatchPlayerRuntime): Array<{
+  zone: MatchHitZone;
+  center: Point3;
+  radius: number;
+}> {
+  const baseY = target.pose.y;
+  const crouched = target.pose.crouched;
+  return [
+    {
+      zone: "head",
+      center: buildPoint(target.pose.x, baseY + (crouched ? 1.18 : 1.52), target.pose.z),
+      radius: crouched ? 0.16 : 0.18,
+    },
+    {
+      zone: "body",
+      center: buildPoint(target.pose.x, baseY + (crouched ? 0.86 : 1.02), target.pose.z),
+      radius: crouched ? 0.28 : 0.32,
+    },
+    {
+      zone: "leg",
+      center: buildPoint(target.pose.x, baseY + (crouched ? 0.46 : 0.56), target.pose.z),
+      radius: crouched ? 0.24 : 0.28,
+    },
+  ];
+}
+
+function resolveRifleDamage(distance: number, zone: MatchHitZone) {
+  if (zone === "head") {
+    const oneShotRange = 16;
+    const falloffEndRange = 58;
+    const t = clamp01((distance - oneShotRange) / (falloffEndRange - oneShotRange));
+    return Math.round(125 + (62 - 125) * t);
+  }
+  if (zone === "leg") {
+    return 13;
+  }
+  return 15;
+}
+
+function applyDueTransitions(match: MatchRuntime, nowMs: number) {
+  let changed = false;
+  const playerStates: MatchPlayerRealtimeStatePayload[] = [];
+
+  for (const player of match.players.values()) {
+    if (player.reloadingUntilMs !== null && nowMs >= player.reloadingUntilMs) {
+      player.reloadingUntilMs = null;
+      player.magAmmo = MATCH_MAX_MAG_AMMO;
+      changed = true;
+    }
+
+    if (!player.alive && player.respawnAtMs !== null && nowMs >= player.respawnAtMs) {
+      player.alive = true;
+      player.health = MATCH_MAX_HEALTH;
+      player.respawnAtMs = null;
+      player.magAmmo = MATCH_MAX_MAG_AMMO;
+      player.reloadingUntilMs = null;
+      player.lastShotAtMs = null;
+      player.pose = createSpawnPose(player.spawnSlot, nowMs);
+      changed = true;
+      playerStates.push(buildRealtimePlayerState(player));
+    }
+  }
+
+  return {
+    changed,
+    playerStates,
+  };
+}
+
+function createInitialPlayerRuntime(
+  userId: string,
+  spawnSlot: MatchSpawnSlot,
+  nowMs: number,
+): MatchPlayerRuntime {
+  return {
+    userId,
+    spawnSlot,
+    pose: createSpawnPose(spawnSlot, nowMs),
+    health: MATCH_MAX_HEALTH,
+    alive: true,
+    respawnAtMs: null,
+    magAmmo: MATCH_MAX_MAG_AMMO,
+    reloadingUntilMs: null,
+    lastShotAtMs: null,
+  };
+}
+
+export function createMatchRuntimeManager(): MatchRuntimeManager {
+  const matches = new Map<string, MatchRuntime>();
+
+  const getMatchOrThrow = (code: string) => {
+    const match = matches.get(code);
+    if (!match) {
+      throw new HttpError(409, "Match runtime is unavailable for that lobby.");
+    }
+    return match;
+  };
+
+  return {
+    createMatch(code, lobby) {
+      if (lobby.selectedMapId !== MATCH_MAP_ID) {
+        throw new HttpError(409, "Live multiplayer combat is only wired for map1 right now.");
+      }
+
+      const nowMs = Date.parse(lobby.activeMatch?.startedAt ?? lobby.createdAt);
+      const players = new Map<string, MatchPlayerRuntime>();
+      for (const slot of lobby.activeMatch?.slots ?? []) {
+        players.set(
+          slot.userId,
+          createInitialPlayerRuntime(slot.userId, slot.spawnSlot, nowMs),
+        );
+      }
+
+      const match: MatchRuntime = {
+        code,
+        startedAt: lobby.activeMatch?.startedAt ?? lobby.createdAt,
+        mapId: MATCH_MAP_ID,
+        players,
+      };
+      matches.set(code, match);
+      return buildMatchState(match);
+    },
+
+    destroyMatch(code) {
+      matches.delete(code);
+    },
+
+    destroyAll() {
+      matches.clear();
+    },
+
+    getMatchState(code) {
+      const match = matches.get(code);
+      return match ? buildMatchState(match) : null;
+    },
+
+    getPlayerStates(code) {
+      const match = matches.get(code);
+      if (!match) {
+        return [];
+      }
+      return [...match.players.values()].map(buildRealtimePlayerState);
+    },
+
+    handlePlayerState(code, userId, state, now) {
+      const match = getMatchOrThrow(code);
+      const player = match.players.get(userId);
+      if (!player) {
+        throw new HttpError(403, "You are not in that live match.");
+      }
+
+      const nowMs = now.getTime();
+      const transitions = applyDueTransitions(match, nowMs);
+
+      const x = state.x;
+      const y = state.y;
+      const z = state.z;
+      if (
+        !isFiniteNumber(x) ||
+        !isFiniteNumber(y) ||
+        !isFiniteNumber(z) ||
+        !isFiniteNumber(state.yaw) ||
+        !isFiniteNumber(state.pitch) ||
+        !Number.isInteger(state.seq)
+      ) {
+        throw new HttpError(400, "Realtime player state is invalid.");
+      }
+
+      if (player.alive) {
+        if (
+          x < MAP1_WORLD_BOUNDS.minX ||
+          x > MAP1_WORLD_BOUNDS.maxX ||
+          z < MAP1_WORLD_BOUNDS.minZ ||
+          z > MAP1_WORLD_BOUNDS.maxZ ||
+          y < WORLD_Y_MIN ||
+          y > WORLD_Y_MAX
+        ) {
+          throw new HttpError(409, "Movement update rejected outside the combat bounds.");
+        }
+
+        const nextPoint = buildPoint(x, y, z);
+        validatePositionStep(player.pose, nextPoint, nowMs);
+        if (pointInsideBlocker(nextPoint)) {
+          throw new HttpError(409, "Movement update rejected inside map geometry.");
+        }
+
+        player.pose = {
+          seq: state.seq,
+          x,
+          y,
+          z,
+          yaw: normalizeAngleRadians(state.yaw),
+          pitch: Math.max(-1.5, Math.min(0.85, state.pitch)),
+          moving: state.moving,
+          sprinting: state.sprinting,
+          crouched: state.crouched,
+          grounded: state.grounded,
+          ads: state.ads,
+          updatedAtMs: nowMs,
+        };
+      }
+
+      return {
+        matchState: transitions.changed ? buildMatchState(match) : null,
+        playerStates: [
+          ...transitions.playerStates,
+          ...(player.alive ? [buildRealtimePlayerState(player)] : []),
+        ],
+        shotFired: null,
+      };
+    },
+
+    handleFire(code, userId, shotId, weaponType, now) {
+      const match = getMatchOrThrow(code);
+      const shooter = match.players.get(userId);
+      if (!shooter) {
+        throw new HttpError(403, "You are not in that live match.");
+      }
+
+      const nowMs = now.getTime();
+      const transitions = applyDueTransitions(match, nowMs);
+
+      if (!shooter.alive) {
+        throw new HttpError(409, "Dead players cannot fire.");
+      }
+      if (weaponType !== "rifle") {
+        throw new HttpError(409, "Only the rifle is enabled in live multiplayer right now.");
+      }
+      if (shooter.reloadingUntilMs !== null && nowMs < shooter.reloadingUntilMs) {
+        throw new HttpError(409, "Reload still in progress.");
+      }
+      if (shooter.magAmmo <= 0) {
+        throw new HttpError(409, "Rifle magazine is empty.");
+      }
+      if (
+        shooter.lastShotAtMs !== null &&
+        nowMs - shooter.lastShotAtMs < MATCH_FIRE_INTERVAL_MS
+      ) {
+        throw new HttpError(409, "Shot rejected for exceeding rifle fire rate.");
+      }
+
+      shooter.lastShotAtMs = nowMs;
+      shooter.magAmmo = Math.max(0, shooter.magAmmo - 1);
+
+      const origin = buildPoint(
+        shooter.pose.x,
+        shooter.pose.y + resolveEyeHeight(shooter.pose.crouched),
+        shooter.pose.z,
+      );
+      const direction = directionFromYawPitch(shooter.pose.yaw, shooter.pose.pitch);
+
+      let closestHit:
+        | {
+            target: MatchPlayerRuntime;
+            zone: MatchHitZone;
+            distance: number;
+          }
+        | null = null;
+
+      for (const target of match.players.values()) {
+        if (target.userId === shooter.userId || !target.alive) {
+          continue;
+        }
+
+        for (const sphere of resolveHitSpheres(target)) {
+          const distance = intersectRaySphere(origin, direction, sphere.center, sphere.radius);
+          if (distance === null) {
+            continue;
+          }
+
+          if (!closestHit || distance < closestHit.distance) {
+            closestHit = {
+              target,
+              zone: sphere.zone,
+              distance,
+            };
+          }
+        }
+      }
+
+      let hit: ShotFiredPayload["hit"] = null;
+      if (closestHit) {
+        const blockerDistance = MAP1_BLOCKERS
+          .map((blocker) => intersectRayAabb(origin, direction, blocker))
+          .filter((distance): distance is number => distance !== null)
+          .sort((left, right) => left - right)[0] ?? null;
+
+        if (blockerDistance === null || blockerDistance > closestHit.distance) {
+          const damage = resolveRifleDamage(closestHit.distance, closestHit.zone);
+          const remainingHealth = Math.max(0, closestHit.target.health - damage);
+          closestHit.target.health = remainingHealth;
+          const killed = remainingHealth <= 0;
+          if (killed) {
+            closestHit.target.alive = false;
+            closestHit.target.respawnAtMs = nowMs + MATCH_RESPAWN_MS;
+            closestHit.target.reloadingUntilMs = null;
+            closestHit.target.lastShotAtMs = null;
+          }
+          hit = {
+            userId: closestHit.target.userId,
+            zone: closestHit.zone,
+            damage,
+            remainingHealth,
+            killed,
+            impactPoint: [
+              origin.x + direction.x * closestHit.distance,
+              origin.y + direction.y * closestHit.distance,
+              origin.z + direction.z * closestHit.distance,
+            ],
+          };
+        }
+      }
+
+      if (shooter.magAmmo <= 0 && shooter.reloadingUntilMs === null) {
+        shooter.reloadingUntilMs = nowMs + MATCH_RELOAD_MS;
+      }
+
+      return {
+        matchState: buildMatchState(match),
+        playerStates: transitions.playerStates,
+        shotFired: {
+          userId: shooter.userId,
+          shotId,
+          origin: [origin.x, origin.y, origin.z],
+          direction: [direction.x, direction.y, direction.z],
+          hit,
+        },
+      };
+    },
+
+    handleReload(code, userId, now) {
+      const match = getMatchOrThrow(code);
+      const player = match.players.get(userId);
+      if (!player) {
+        throw new HttpError(403, "You are not in that live match.");
+      }
+
+      const nowMs = now.getTime();
+      const transitions = applyDueTransitions(match, nowMs);
+
+      if (!player.alive) {
+        throw new HttpError(409, "Dead players cannot reload.");
+      }
+      if (player.reloadingUntilMs !== null && nowMs < player.reloadingUntilMs) {
+        throw new HttpError(409, "Reload already in progress.");
+      }
+      if (player.magAmmo >= MATCH_MAX_MAG_AMMO) {
+        throw new HttpError(409, "Rifle magazine is already full.");
+      }
+
+      player.reloadingUntilMs = nowMs + MATCH_RELOAD_MS;
+      return {
+        matchState: buildMatchState(match),
+        playerStates: transitions.playerStates,
+        shotFired: null,
+      };
+    },
+  };
+}
