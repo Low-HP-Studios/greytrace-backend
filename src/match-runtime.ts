@@ -15,11 +15,23 @@ const MATCH_MAX_MAG_AMMO = 30;
 const MATCH_FIRE_INTERVAL_MS = 130;
 const MATCH_RELOAD_MS = 3_000;
 const MATCH_RESPAWN_MS = 3_000;
-const MAX_POSITION_STEP_METERS = 1.25;
-const MAX_SPEED_MPS = 12;
+const MAP1_JUMP_PAD_BOOST = 35;
+const MAP1_JUMP_PAD_LAUNCH_SPEED = 21;
+const MAX_GROUNDED_POSITION_STEP_METERS = 1.25;
+const MAX_AIRBORNE_POSITION_STEP_METERS = 1.6;
+const MAX_JUMP_PAD_POSITION_STEP_METERS = 2.4;
+const MAX_GROUNDED_SPEED_MPS = 12;
+const MAX_AIRBORNE_SPEED_MPS = 18;
+const MAX_JUMP_PAD_SPEED_MPS = Math.hypot(
+  MAP1_JUMP_PAD_LAUNCH_SPEED,
+  MAP1_JUMP_PAD_BOOST,
+) + 2;
 const PLAYER_BLOCKER_MARGIN = 0.2;
 const WORLD_Y_MIN = -2;
-const WORLD_Y_MAX = 8;
+const DEFAULT_WORLD_Y_MAX = 6;
+const JUMP_PAD_WORLD_Y_MAX = 26;
+const JUMP_PAD_DETECTION_MAX_Y = 1.4;
+const JUMP_PAD_GRACE_MS = 2_500;
 
 type MatchSpawnSlot = MatchPlayerStatePayload["spawnSlot"];
 
@@ -37,6 +49,7 @@ type MatchPlayerRuntime = {
   magAmmo: number;
   reloadingUntilMs: number | null;
   lastShotAtMs: number | null;
+  jumpPadGraceUntilMs: number | null;
 };
 
 type MatchRuntime = {
@@ -55,6 +68,14 @@ type Point3 = {
 type BlockingVolume = {
   center: [number, number, number];
   size: [number, number, number];
+};
+
+type JumpPadVolume = {
+  minX: number;
+  maxX: number;
+  minZ: number;
+  maxZ: number;
+  y: number;
 };
 
 type WorldBounds = {
@@ -114,12 +135,34 @@ function crate(
   return { center: [cx, h / 2, cz], size: [sx, h, sz] };
 }
 
-const MAP1_WORLD_BOUNDS: WorldBounds = {
+const MAP1_PLAYER_BOUNDS: WorldBounds = {
   minX: -41.85,
   maxX: 41.85,
   minZ: -54.85,
   maxZ: 54.85,
 };
+
+const MAP1_JUMP_PAD_WIDTH = 8 * Math.sqrt(0.6);
+const MAP1_JUMP_PAD_DEPTH = 6 * Math.sqrt(0.6);
+
+function jumpPad(centerX: number, centerZ: number): JumpPadVolume {
+  const halfWidth = MAP1_JUMP_PAD_WIDTH / 2;
+  const halfDepth = MAP1_JUMP_PAD_DEPTH / 2;
+  return {
+    minX: centerX - halfWidth,
+    maxX: centerX + halfWidth,
+    minZ: centerZ - halfDepth,
+    maxZ: centerZ + halfDepth,
+    y: 0,
+  };
+}
+
+const MAP1_JUMP_PADS: readonly JumpPadVolume[] = [
+  jumpPad(-31, -40),
+  jumpPad(31, -40),
+  jumpPad(-31, 40),
+  jumpPad(31, 40),
+];
 
 const MAP1_BLOCKERS: readonly BlockingVolume[] = [
   wall(0, -55, 84, 0.3),
@@ -191,10 +234,14 @@ function normalizeAngleRadians(value: number) {
   return normalized;
 }
 
-function createSpawnPose(spawnSlot: MatchSpawnSlot, updatedAtMs: number): MatchPlayerPoseState {
+function createSpawnPose(
+  spawnSlot: MatchSpawnSlot,
+  updatedAtMs: number,
+  seq = 0,
+): MatchPlayerPoseState {
   const spawn = MAP1_SPAWNS[spawnSlot];
   return {
-    seq: 0,
+    seq,
     x: spawn.position[0],
     y: spawn.position[1],
     z: spawn.position[2],
@@ -378,9 +425,61 @@ function pointInsideBlocker(point: Point3) {
   });
 }
 
-function validatePositionStep(previous: MatchPlayerPoseState, next: Point3, nowMs: number) {
+function findJumpPadIndex(point: Point3) {
+  return MAP1_JUMP_PADS.findIndex((pad) =>
+    point.x >= pad.minX &&
+    point.x <= pad.maxX &&
+    point.z >= pad.minZ &&
+    point.z <= pad.maxZ &&
+    point.y >= pad.y - 0.25 &&
+    point.y <= pad.y + JUMP_PAD_DETECTION_MAX_Y
+  );
+}
+
+function isJumpPadGraceActive(player: MatchPlayerRuntime, nowMs: number) {
+  return player.jumpPadGraceUntilMs !== null && player.jumpPadGraceUntilMs > nowMs;
+}
+
+function resolveJumpPadActivation(
+  player: MatchPlayerRuntime,
+  next: Point3,
+  grounded: boolean,
+): boolean {
+  if (grounded) {
+    return false;
+  }
+  const previousPoint = buildPoint(player.pose.x, player.pose.y, player.pose.z);
+  return findJumpPadIndex(previousPoint) !== -1 || findJumpPadIndex(next) !== -1;
+}
+
+function resolveMaxAllowedY(player: MatchPlayerRuntime, nowMs: number) {
+  return isJumpPadGraceActive(player, nowMs) ? JUMP_PAD_WORLD_Y_MAX : DEFAULT_WORLD_Y_MAX;
+}
+
+function pointInsidePlayerBounds(point: Point3, maxY: number) {
+  return point.x >= MAP1_PLAYER_BOUNDS.minX &&
+    point.x <= MAP1_PLAYER_BOUNDS.maxX &&
+    point.z >= MAP1_PLAYER_BOUNDS.minZ &&
+    point.z <= MAP1_PLAYER_BOUNDS.maxZ &&
+    point.y >= WORLD_Y_MIN &&
+    point.y <= maxY;
+}
+
+function validatePositionStep(
+  previous: MatchPlayerPoseState,
+  next: Point3,
+  nowMs: number,
+  options: {
+    grounded: boolean;
+    jumpPadGraceActive: boolean;
+  },
+) {
   const dtSeconds = Math.max(0.05, (nowMs - previous.updatedAtMs) / 1000);
-  const maxDistance = MAX_POSITION_STEP_METERS + MAX_SPEED_MPS * dtSeconds;
+  const maxDistance = options.jumpPadGraceActive
+    ? MAX_JUMP_PAD_POSITION_STEP_METERS + MAX_JUMP_PAD_SPEED_MPS * dtSeconds
+    : options.grounded
+    ? MAX_GROUNDED_POSITION_STEP_METERS + MAX_GROUNDED_SPEED_MPS * dtSeconds
+    : MAX_AIRBORNE_POSITION_STEP_METERS + MAX_AIRBORNE_SPEED_MPS * dtSeconds;
   const actualDistance = distanceBetween(
     buildPoint(previous.x, previous.y, previous.z),
     next,
@@ -451,7 +550,8 @@ function applyDueTransitions(match: MatchRuntime, nowMs: number) {
       player.magAmmo = MATCH_MAX_MAG_AMMO;
       player.reloadingUntilMs = null;
       player.lastShotAtMs = null;
-      player.pose = createSpawnPose(player.spawnSlot, nowMs);
+      player.jumpPadGraceUntilMs = null;
+      player.pose = createSpawnPose(player.spawnSlot, nowMs, player.pose.seq);
       changed = true;
       playerStates.push(buildRealtimePlayerState(player));
     }
@@ -478,6 +578,7 @@ function createInitialPlayerRuntime(
     magAmmo: MATCH_MAX_MAG_AMMO,
     reloadingUntilMs: null,
     lastShotAtMs: null,
+    jumpPadGraceUntilMs: null,
   };
 }
 
@@ -563,19 +664,33 @@ export function createMatchRuntimeManager(): MatchRuntimeManager {
       }
 
       if (player.alive) {
-        if (
-          x < MAP1_WORLD_BOUNDS.minX ||
-          x > MAP1_WORLD_BOUNDS.maxX ||
-          z < MAP1_WORLD_BOUNDS.minZ ||
-          z > MAP1_WORLD_BOUNDS.maxZ ||
-          y < WORLD_Y_MIN ||
-          y > WORLD_Y_MAX
-        ) {
-          throw new HttpError(409, "Movement update rejected outside the combat bounds.");
+        if (state.seq <= player.pose.seq) {
+          return {
+            matchState: transitions.changed ? buildMatchState(match) : null,
+            playerStates: transitions.playerStates,
+            shotFired: null,
+          };
         }
 
         const nextPoint = buildPoint(x, y, z);
-        validatePositionStep(player.pose, nextPoint, nowMs);
+        const shouldActivateJumpPadGrace = resolveJumpPadActivation(
+          player,
+          nextPoint,
+          state.grounded,
+        );
+        const jumpPadGraceActive = shouldActivateJumpPadGrace || isJumpPadGraceActive(player, nowMs);
+        if (!pointInsidePlayerBounds(nextPoint, jumpPadGraceActive ? JUMP_PAD_WORLD_Y_MAX : resolveMaxAllowedY(player, nowMs))) {
+          return {
+            matchState: transitions.changed ? buildMatchState(match) : null,
+            playerStates: transitions.playerStates,
+            shotFired: null,
+          };
+        }
+
+        validatePositionStep(player.pose, nextPoint, nowMs, {
+          grounded: state.grounded,
+          jumpPadGraceActive,
+        });
         if (pointInsideBlocker(nextPoint)) {
           throw new HttpError(409, "Movement update rejected inside map geometry.");
         }
@@ -594,6 +709,14 @@ export function createMatchRuntimeManager(): MatchRuntimeManager {
           ads: state.ads,
           updatedAtMs: nowMs,
         };
+        if (shouldActivateJumpPadGrace) {
+          player.jumpPadGraceUntilMs = nowMs + JUMP_PAD_GRACE_MS;
+        } else if (
+          player.jumpPadGraceUntilMs !== null &&
+          (state.grounded || nowMs >= player.jumpPadGraceUntilMs)
+        ) {
+          player.jumpPadGraceUntilMs = null;
+        }
       }
 
       return {
@@ -617,22 +740,46 @@ export function createMatchRuntimeManager(): MatchRuntimeManager {
       const transitions = applyDueTransitions(match, nowMs);
 
       if (!shooter.alive) {
-        throw new HttpError(409, "Dead players cannot fire.");
+        return {
+          matchState: transitions.changed ? buildMatchState(match) : null,
+          playerStates: transitions.playerStates,
+          shotFired: null,
+        };
       }
       if (weaponType !== "rifle") {
         throw new HttpError(409, "Only the rifle is enabled in live multiplayer right now.");
       }
       if (shooter.reloadingUntilMs !== null && nowMs < shooter.reloadingUntilMs) {
-        throw new HttpError(409, "Reload still in progress.");
+        return {
+          matchState: transitions.changed ? buildMatchState(match) : null,
+          playerStates: transitions.playerStates,
+          shotFired: null,
+        };
       }
       if (shooter.magAmmo <= 0) {
-        throw new HttpError(409, "Rifle magazine is empty.");
+        if (shooter.reloadingUntilMs === null) {
+          shooter.reloadingUntilMs = nowMs + MATCH_RELOAD_MS;
+          return {
+            matchState: buildMatchState(match),
+            playerStates: transitions.playerStates,
+            shotFired: null,
+          };
+        }
+        return {
+          matchState: transitions.changed ? buildMatchState(match) : null,
+          playerStates: transitions.playerStates,
+          shotFired: null,
+        };
       }
       if (
         shooter.lastShotAtMs !== null &&
         nowMs - shooter.lastShotAtMs < MATCH_FIRE_INTERVAL_MS
       ) {
-        throw new HttpError(409, "Shot rejected for exceeding rifle fire rate.");
+        return {
+          matchState: transitions.changed ? buildMatchState(match) : null,
+          playerStates: transitions.playerStates,
+          shotFired: null,
+        };
       }
 
       shooter.lastShotAtMs = nowMs;
@@ -735,13 +882,25 @@ export function createMatchRuntimeManager(): MatchRuntimeManager {
       const transitions = applyDueTransitions(match, nowMs);
 
       if (!player.alive) {
-        throw new HttpError(409, "Dead players cannot reload.");
+        return {
+          matchState: transitions.changed ? buildMatchState(match) : null,
+          playerStates: transitions.playerStates,
+          shotFired: null,
+        };
       }
       if (player.reloadingUntilMs !== null && nowMs < player.reloadingUntilMs) {
-        throw new HttpError(409, "Reload already in progress.");
+        return {
+          matchState: transitions.changed ? buildMatchState(match) : null,
+          playerStates: transitions.playerStates,
+          shotFired: null,
+        };
       }
       if (player.magAmmo >= MATCH_MAX_MAG_AMMO) {
-        throw new HttpError(409, "Rifle magazine is already full.");
+        return {
+          matchState: transitions.changed ? buildMatchState(match) : null,
+          playerStates: transitions.playerStates,
+          shotFired: null,
+        };
       }
 
       player.reloadingUntilMs = nowMs + MATCH_RELOAD_MS;

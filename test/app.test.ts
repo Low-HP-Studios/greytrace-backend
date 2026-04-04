@@ -159,6 +159,48 @@ function waitForSocketMessage<T extends RealtimeMessage>(
   });
 }
 
+function expectNoSocketMessage<T extends RealtimeMessage>(
+  socket: WebSocket,
+  predicate: (message: RealtimeMessage) => message is T,
+  timeoutMs = 200,
+) {
+  return new Promise<void>((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, timeoutMs);
+
+    const onMessage = (raw: WebSocket.RawData) => {
+      const text = Array.isArray(raw)
+        ? Buffer.concat(raw).toString("utf8")
+        : raw instanceof Buffer
+        ? raw.toString("utf8")
+        : raw.toString();
+      const message = JSON.parse(text) as RealtimeMessage;
+      if (!predicate(message)) {
+        return;
+      }
+
+      cleanup();
+      reject(new Error(`Unexpected websocket message: ${text}`));
+    };
+
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+
+    const cleanup = () => {
+      clearTimeout(timeoutId);
+      socket.off("message", onMessage);
+      socket.off("error", onError);
+    };
+
+    socket.on("message", onMessage);
+    socket.on("error", onError);
+  });
+}
+
 async function connectRealtime(
   harness: TestHarness,
   token: string,
@@ -1134,6 +1176,29 @@ test("live player_state broadcasts accepted movement and rejects impossible tele
     assert.equal(mirroredMove.player.z, -25);
     assert.equal(mirroredMove.player.sprinting, true);
 
+    sendPlayerState(hostRealtime.socket, {
+      seq: 1,
+      x: -28,
+      y: 0.5,
+      z: 25,
+      yaw: 0,
+      pitch: 0,
+      moving: true,
+      sprinting: true,
+      crouched: false,
+      grounded: true,
+      ads: false,
+    });
+
+    await expectNoSocketMessage(
+      guestRealtime.socket,
+      (message): message is { type: "player_state"; player: MatchPlayerRealtimeStatePayload } =>
+        message.type === "player_state" &&
+        message.player.userId === match.host.body.user.id &&
+        message.player.seq === 1 &&
+        message.player.x < 0,
+    );
+
     const teleportRejectedPromise = waitForSocketMessage(
       hostRealtime.socket,
       (message): message is { type: "error"; message: string } =>
@@ -1157,6 +1222,78 @@ test("live player_state broadcasts accepted movement and rejects impossible tele
 
     const teleportRejected = await teleportRejectedPromise;
     assert.equal(teleportRejected.message, "Movement update rejected as an impossible teleport.");
+  } finally {
+    hostRealtime?.socket.terminate();
+    guestRealtime?.socket.terminate();
+    await harness.close();
+  }
+});
+
+test("jump pad launches stay inside the accepted live movement envelope", async () => {
+  const harness = await createHarness();
+  let hostRealtime: Awaited<ReturnType<typeof connectRealtime>> | null = null;
+  let guestRealtime: Awaited<ReturnType<typeof connectRealtime>> | null = null;
+
+  try {
+    const match = await createStartedLiveMatch(harness, "JumpHost", "JumpGuest");
+    hostRealtime = match.hostRealtime;
+    guestRealtime = match.guestRealtime;
+
+    harness.advanceTime(10_000);
+
+    const stagingMovePromise = waitForSocketMessage(
+      guestRealtime.socket,
+      (message): message is { type: "player_state"; player: MatchPlayerRealtimeStatePayload } =>
+        message.type === "player_state" &&
+        message.player.userId === match.host.body.user.id &&
+        message.player.seq === 1,
+    );
+
+    sendPlayerState(hostRealtime.socket, {
+      seq: 1,
+      x: -31,
+      y: 0.5,
+      z: -40,
+      yaw: Math.PI,
+      pitch: 0,
+      moving: true,
+      sprinting: false,
+      crouched: false,
+      grounded: true,
+      ads: false,
+    });
+
+    await stagingMovePromise;
+    harness.advanceTime(400);
+
+    const launchMovePromise = waitForSocketMessage(
+      guestRealtime.socket,
+      (message): message is { type: "player_state"; player: MatchPlayerRealtimeStatePayload } =>
+        message.type === "player_state" &&
+        message.player.userId === match.host.body.user.id &&
+        message.player.seq === 2,
+    );
+
+    sendPlayerState(hostRealtime.socket, {
+      seq: 2,
+      x: -27,
+      y: 12,
+      z: -32,
+      yaw: Math.PI,
+      pitch: -0.05,
+      moving: true,
+      sprinting: true,
+      crouched: false,
+      grounded: false,
+      ads: false,
+    });
+
+    const launchMove = await launchMovePromise;
+    assert.ok(launchMove.player.y >= 12);
+    await expectNoSocketMessage(
+      hostRealtime.socket,
+      (message): message is { type: "error"; message: string } => message.type === "error",
+    );
   } finally {
     hostRealtime?.socket.terminate();
     guestRealtime?.socket.terminate();
@@ -1296,6 +1433,91 @@ test("backend-confirmed headshots kill players and respawn them after three seco
     assert.equal(respawnedGuest?.health, 100);
     assert.equal(respawnedGuest?.magAmmo, 30);
     assert.equal(respawnPose.player.alive, true);
+  } finally {
+    hostRealtime?.socket.terminate();
+    guestRealtime?.socket.terminate();
+    await harness.close();
+  }
+});
+
+test("dead fire and reload inputs become no-op sync instead of websocket errors", async () => {
+  const harness = await createHarness();
+  let hostRealtime: Awaited<ReturnType<typeof connectRealtime>> | null = null;
+  let guestRealtime: Awaited<ReturnType<typeof connectRealtime>> | null = null;
+
+  try {
+    const match = await createStartedLiveMatch(harness, "DeadNoopHost", "DeadNoopGuest");
+    hostRealtime = match.hostRealtime;
+    guestRealtime = match.guestRealtime;
+
+    harness.advanceTime(10_000);
+
+    const hostMirrorPromise = waitForSocketMessage(
+      guestRealtime.socket,
+      (message): message is { type: "player_state"; player: MatchPlayerRealtimeStatePayload } =>
+        message.type === "player_state" &&
+        message.player.userId === match.host.body.user.id &&
+        message.player.seq === 1,
+    );
+    const guestMirrorPromise = waitForSocketMessage(
+      hostRealtime.socket,
+      (message): message is { type: "player_state"; player: MatchPlayerRealtimeStatePayload } =>
+        message.type === "player_state" &&
+        message.player.userId === match.guest.body.user.id &&
+        message.player.seq === 1,
+    );
+
+    sendPlayerState(hostRealtime.socket, {
+      seq: 1,
+      x: 28,
+      y: 0.5,
+      z: -25,
+      yaw: Math.PI,
+      pitch: 0.012,
+      moving: false,
+      sprinting: false,
+      crouched: false,
+      grounded: true,
+      ads: true,
+    });
+    sendPlayerState(guestRealtime.socket, {
+      seq: 1,
+      x: 28,
+      y: 0.5,
+      z: -15,
+      yaw: 0,
+      pitch: 0,
+      moving: false,
+      sprinting: false,
+      crouched: false,
+      grounded: true,
+      ads: false,
+    });
+
+    await hostMirrorPromise;
+    await guestMirrorPromise;
+
+    const killStatePromise = waitForSocketMessage(
+      hostRealtime.socket,
+      (message): message is { type: "match_state"; state: MatchStatePayload } =>
+        message.type === "match_state" &&
+        message.state.players.some((player) =>
+          player.userId === match.guest.body.user.id &&
+          player.alive === false &&
+          player.health === 0
+        ),
+    );
+
+    sendFire(hostRealtime.socket, "dead-noop-headshot");
+    await killStatePromise;
+
+    sendFire(guestRealtime.socket, "dead-fire-1");
+    sendReload(guestRealtime.socket, "dead-reload-1");
+
+    await expectNoSocketMessage(
+      guestRealtime.socket,
+      (message): message is { type: "error"; message: string } => message.type === "error",
+    );
   } finally {
     hostRealtime?.socket.terminate();
     guestRealtime?.socket.terminate();
