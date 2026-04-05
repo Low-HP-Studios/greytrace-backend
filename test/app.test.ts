@@ -255,12 +255,18 @@ function sendPlayerState(
     y: overrides.y,
     z: overrides.z,
     yaw: overrides.yaw,
+    bodyYaw: overrides.bodyYaw ?? overrides.yaw,
     pitch: overrides.pitch,
     moving: overrides.moving ?? false,
     sprinting: overrides.sprinting ?? false,
     crouched: overrides.crouched ?? false,
     grounded: overrides.grounded ?? true,
     ads: overrides.ads ?? false,
+    animState: overrides.animState ?? "rifleIdle",
+    locomotionScale: overrides.locomotionScale ?? 1,
+    lowerBodyState: overrides.lowerBodyState ?? null,
+    lowerBodyLocomotionScale: overrides.lowerBodyLocomotionScale ?? 1,
+    upperBodyState: overrides.upperBodyState ?? null,
   }));
 }
 
@@ -277,6 +283,20 @@ function sendReload(socket: WebSocket, requestId: string) {
     type: "reload",
     requestId,
   }));
+}
+
+function resolveAimToPoint(
+  origin: [number, number, number],
+  target: [number, number, number],
+) {
+  const dx = target[0] - origin[0];
+  const dy = target[1] - origin[1];
+  const dz = target[2] - origin[2];
+  const planarDistance = Math.hypot(dx, dz);
+  return {
+    yaw: Math.atan2(-dx, -dz),
+    pitch: Math.atan2(dy, Math.max(0.0001, planarDistance)),
+  };
 }
 
 async function createStartedLiveMatch(
@@ -1433,6 +1453,108 @@ test("backend-confirmed headshots kill players and respawn them after three seco
     assert.equal(respawnedGuest?.health, 100);
     assert.equal(respawnedGuest?.magAmmo, 30);
     assert.equal(respawnPose.player.alive, true);
+  } finally {
+    hostRealtime?.socket.terminate();
+    guestRealtime?.socket.terminate();
+    await harness.close();
+  }
+});
+
+test("expanded live hit volumes catch shoulder-edge shots that the old center spheres missed", async () => {
+  const harness = await createHarness();
+  let hostRealtime: Awaited<ReturnType<typeof connectRealtime>> | null = null;
+  let guestRealtime: Awaited<ReturnType<typeof connectRealtime>> | null = null;
+
+  try {
+    const match = await createStartedLiveMatch(harness, "ShoulderHost", "ShoulderGuest");
+    hostRealtime = match.hostRealtime;
+    guestRealtime = match.guestRealtime;
+
+    harness.advanceTime(10_000);
+
+    const shooterOrigin: [number, number, number] = [0, 1.9, -25];
+    const shoulderAimPoint: [number, number, number] = [0.42, 1.58, -15.04];
+    const aim = resolveAimToPoint(shooterOrigin, shoulderAimPoint);
+
+    const hostMirrorPromise = waitForSocketMessage(
+      guestRealtime.socket,
+      (message): message is { type: "player_state"; player: MatchPlayerRealtimeStatePayload } =>
+        message.type === "player_state" &&
+        message.player.userId === match.host.body.user.id &&
+        message.player.seq === 1,
+    );
+    const guestMirrorPromise = waitForSocketMessage(
+      hostRealtime.socket,
+      (message): message is { type: "player_state"; player: MatchPlayerRealtimeStatePayload } =>
+        message.type === "player_state" &&
+        message.player.userId === match.guest.body.user.id &&
+        message.player.seq === 1,
+    );
+
+    sendPlayerState(hostRealtime.socket, {
+      seq: 1,
+      x: 0,
+      y: 0.5,
+      z: -25,
+      yaw: aim.yaw,
+      bodyYaw: Math.PI,
+      pitch: aim.pitch,
+      moving: false,
+      sprinting: false,
+      crouched: false,
+      grounded: true,
+      ads: true,
+      animState: "rifleAimHold",
+      upperBodyState: "rifleAimHold",
+    });
+    sendPlayerState(guestRealtime.socket, {
+      seq: 1,
+      x: 0,
+      y: 0.5,
+      z: -15,
+      yaw: 0,
+      bodyYaw: 0,
+      pitch: 0,
+      moving: true,
+      sprinting: false,
+      crouched: false,
+      grounded: true,
+      ads: false,
+      animState: "rifleJogRight",
+      locomotionScale: 1,
+      upperBodyState: "rifleAimHold",
+    });
+
+    await hostMirrorPromise;
+    await guestMirrorPromise;
+
+    const shotPromise = waitForSocketMessage(
+      hostRealtime.socket,
+      (message): message is { type: "shot_fired"; shot: ShotFiredPayload } =>
+        message.type === "shot_fired" &&
+        message.shot.shotId === "shoulder-edge-1",
+    );
+    const damageStatePromise = waitForSocketMessage(
+      hostRealtime.socket,
+      (message): message is { type: "match_state"; state: MatchStatePayload } =>
+        message.type === "match_state" &&
+        message.state.players.some((player) =>
+          player.userId === match.guest.body.user.id &&
+          player.health < 100
+        ),
+    );
+
+    sendFire(hostRealtime.socket, "shoulder-edge-1");
+
+    const shot = await shotPromise;
+    const damageState = await damageStatePromise;
+    const damagedGuest = damageState.state.players.find((player) =>
+      player.userId === match.guest.body.user.id
+    );
+
+    assert.equal(shot.shot.hit?.userId, match.guest.body.user.id);
+    assert.equal(shot.shot.hit?.zone, "body");
+    assert.equal(damagedGuest?.health, 85);
   } finally {
     hostRealtime?.socket.terminate();
     guestRealtime?.socket.terminate();

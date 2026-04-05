@@ -132,6 +132,34 @@ function parseMessage(raw: RawData): RealtimeClientMessage {
       }
     }
 
+    const optionalFiniteNumber = (
+      value: unknown,
+      fallback: number,
+      field: string,
+    ) => {
+      if (value == null) {
+        return fallback;
+      }
+      if (typeof value !== "number" || !Number.isFinite(value)) {
+        throw new HttpError(400, `Realtime player state field "${field}" is invalid.`);
+      }
+      return value;
+    };
+
+    const optionalStringOrNull = (
+      value: unknown,
+      fallback: string | null,
+      field: string,
+    ) => {
+      if (value == null) {
+        return fallback;
+      }
+      if (typeof value !== "string") {
+        throw new HttpError(400, `Realtime player state field "${field}" is invalid.`);
+      }
+      return value;
+    };
+
     return {
       type: "player_state",
       seq: parsedRecord.seq as number,
@@ -139,12 +167,42 @@ function parseMessage(raw: RawData): RealtimeClientMessage {
       y: parsedRecord.y as number,
       z: parsedRecord.z as number,
       yaw: parsedRecord.yaw as number,
+      bodyYaw: optionalFiniteNumber(
+        parsedRecord.bodyYaw,
+        parsedRecord.yaw as number,
+        "bodyYaw",
+      ),
       pitch: parsedRecord.pitch as number,
       moving: parsedRecord.moving as boolean,
       sprinting: parsedRecord.sprinting as boolean,
       crouched: parsedRecord.crouched as boolean,
       grounded: parsedRecord.grounded as boolean,
       ads: parsedRecord.ads as boolean,
+      animState: optionalStringOrNull(
+        parsedRecord.animState,
+        "rifleIdle",
+        "animState",
+      ) ?? "rifleIdle",
+      locomotionScale: optionalFiniteNumber(
+        parsedRecord.locomotionScale,
+        1,
+        "locomotionScale",
+      ),
+      lowerBodyState: optionalStringOrNull(
+        parsedRecord.lowerBodyState,
+        null,
+        "lowerBodyState",
+      ),
+      lowerBodyLocomotionScale: optionalFiniteNumber(
+        parsedRecord.lowerBodyLocomotionScale,
+        1,
+        "lowerBodyLocomotionScale",
+      ),
+      upperBodyState: optionalStringOrNull(
+        parsedRecord.upperBodyState,
+        null,
+        "upperBodyState",
+      ),
     };
   }
 

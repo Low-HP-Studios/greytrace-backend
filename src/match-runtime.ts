@@ -65,6 +65,12 @@ type Point3 = {
   z: number;
 };
 
+type MatchHitSphere = {
+  zone: MatchHitZone;
+  center: Point3;
+  radius: number;
+};
+
 type BlockingVolume = {
   center: [number, number, number];
   size: [number, number, number];
@@ -246,12 +252,18 @@ function createSpawnPose(
     y: spawn.position[1],
     z: spawn.position[2],
     yaw: spawn.yaw,
+    bodyYaw: spawn.yaw,
     pitch: spawn.pitch,
     moving: false,
     sprinting: false,
     crouched: false,
     grounded: true,
     ads: false,
+    animState: "rifleIdle",
+    locomotionScale: 1,
+    lowerBodyState: null,
+    lowerBodyLocomotionScale: 1,
+    upperBodyState: null,
     updatedAtMs,
   };
 }
@@ -264,12 +276,18 @@ function buildRealtimePlayerState(player: MatchPlayerRuntime): MatchPlayerRealti
     y: player.pose.y,
     z: player.pose.z,
     yaw: player.pose.yaw,
+    bodyYaw: player.pose.bodyYaw,
     pitch: player.pose.pitch,
     moving: player.pose.moving,
     sprinting: player.pose.sprinting,
     crouched: player.pose.crouched,
     grounded: player.pose.grounded,
     ads: player.pose.ads,
+    animState: player.pose.animState,
+    locomotionScale: player.pose.locomotionScale,
+    lowerBodyState: player.pose.lowerBodyState,
+    lowerBodyLocomotionScale: player.pose.lowerBodyLocomotionScale,
+    upperBodyState: player.pose.upperBodyState,
     alive: player.alive,
   };
 }
@@ -493,30 +511,143 @@ function resolveEyeHeight(crouched: boolean) {
   return crouched ? 1.08 : 1.4;
 }
 
-function resolveHitSpheres(target: MatchPlayerRuntime): Array<{
-  zone: MatchHitZone;
-  center: Point3;
-  radius: number;
-}> {
-  const baseY = target.pose.y;
-  const crouched = target.pose.crouched;
+function resolveRightFromYaw(yaw: number): Point3 {
+  return {
+    x: Math.cos(yaw),
+    y: 0,
+    z: -Math.sin(yaw),
+  };
+}
+
+function resolveForwardFromYaw(yaw: number): Point3 {
+  return {
+    x: -Math.sin(yaw),
+    y: 0,
+    z: -Math.cos(yaw),
+  };
+}
+
+function offsetPoint(
+  origin: Point3,
+  right: Point3,
+  forward: Point3,
+  side: number,
+  up: number,
+  front = 0,
+): Point3 {
+  return {
+    x: origin.x + right.x * side + forward.x * front,
+    y: origin.y + up,
+    z: origin.z + right.z * side + forward.z * front,
+  };
+}
+
+function resolveStandingHitSpheres(
+  origin: Point3,
+  right: Point3,
+  forward: Point3,
+): MatchHitSphere[] {
   return [
     {
       zone: "head",
-      center: buildPoint(target.pose.x, baseY + (crouched ? 1.18 : 1.52), target.pose.z),
-      radius: crouched ? 0.16 : 0.18,
+      center: offsetPoint(origin, right, forward, 0, 1.54, 0.03),
+      radius: 0.2,
     },
     {
       zone: "body",
-      center: buildPoint(target.pose.x, baseY + (crouched ? 0.86 : 1.02), target.pose.z),
-      radius: crouched ? 0.28 : 0.32,
+      center: offsetPoint(origin, right, forward, 0, 1.24, 0.05),
+      radius: 0.2,
+    },
+    {
+      zone: "body",
+      center: offsetPoint(origin, right, forward, -0.22, 1.08, 0.04),
+      radius: 0.22,
+    },
+    {
+      zone: "body",
+      center: offsetPoint(origin, right, forward, 0.22, 1.08, 0.04),
+      radius: 0.22,
+    },
+    {
+      zone: "body",
+      center: offsetPoint(origin, right, forward, 0, 0.95, 0.03),
+      radius: 0.29,
+    },
+    {
+      zone: "body",
+      center: offsetPoint(origin, right, forward, 0, 0.72, 0.01),
+      radius: 0.24,
     },
     {
       zone: "leg",
-      center: buildPoint(target.pose.x, baseY + (crouched ? 0.46 : 0.56), target.pose.z),
-      radius: crouched ? 0.24 : 0.28,
+      center: offsetPoint(origin, right, forward, -0.12, 0.46, 0),
+      radius: 0.21,
+    },
+    {
+      zone: "leg",
+      center: offsetPoint(origin, right, forward, 0.12, 0.46, 0),
+      radius: 0.21,
     },
   ];
+}
+
+function resolveCrouchedHitSpheres(
+  origin: Point3,
+  right: Point3,
+  forward: Point3,
+): MatchHitSphere[] {
+  return [
+    {
+      zone: "head",
+      center: offsetPoint(origin, right, forward, 0, 1.18, 0.09),
+      radius: 0.19,
+    },
+    {
+      zone: "body",
+      center: offsetPoint(origin, right, forward, 0, 0.94, 0.08),
+      radius: 0.21,
+    },
+    {
+      zone: "body",
+      center: offsetPoint(origin, right, forward, -0.18, 0.82, 0.05),
+      radius: 0.2,
+    },
+    {
+      zone: "body",
+      center: offsetPoint(origin, right, forward, 0.18, 0.82, 0.05),
+      radius: 0.2,
+    },
+    {
+      zone: "body",
+      center: offsetPoint(origin, right, forward, 0, 0.7, 0.04),
+      radius: 0.24,
+    },
+    {
+      zone: "body",
+      center: offsetPoint(origin, right, forward, 0, 0.52, 0.02),
+      radius: 0.21,
+    },
+    {
+      zone: "leg",
+      center: offsetPoint(origin, right, forward, -0.1, 0.34, 0),
+      radius: 0.18,
+    },
+    {
+      zone: "leg",
+      center: offsetPoint(origin, right, forward, 0.1, 0.34, 0),
+      radius: 0.18,
+    },
+  ];
+}
+
+function resolveHitSpheres(target: MatchPlayerRuntime): MatchHitSphere[] {
+  const origin = buildPoint(target.pose.x, target.pose.y, target.pose.z);
+  const bodyYaw = target.pose.bodyYaw;
+  const right = resolveRightFromYaw(bodyYaw);
+  const forward = resolveForwardFromYaw(bodyYaw);
+  return target.pose.crouched
+    ? resolveCrouchedHitSpheres(origin, right, forward)
+    : resolveStandingHitSpheres(origin, right, forward);
 }
 
 function resolveRifleDamage(distance: number, zone: MatchHitZone) {
@@ -701,12 +832,18 @@ export function createMatchRuntimeManager(): MatchRuntimeManager {
           y,
           z,
           yaw: normalizeAngleRadians(state.yaw),
+          bodyYaw: normalizeAngleRadians(state.bodyYaw),
           pitch: Math.max(-1.5, Math.min(0.85, state.pitch)),
           moving: state.moving,
           sprinting: state.sprinting,
           crouched: state.crouched,
           grounded: state.grounded,
           ads: state.ads,
+          animState: state.animState,
+          locomotionScale: clamp01(state.locomotionScale / 2) * 2,
+          lowerBodyState: state.lowerBodyState,
+          lowerBodyLocomotionScale: clamp01(state.lowerBodyLocomotionScale / 2) * 2,
+          upperBodyState: state.upperBodyState,
           updatedAtMs: nowMs,
         };
         if (shouldActivateJumpPadGrace) {

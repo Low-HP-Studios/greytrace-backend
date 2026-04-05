@@ -78,12 +78,18 @@ export type MatchPlayerRealtimeStatePayload = {
   y: number;
   z: number;
   yaw: number;
+  bodyYaw: number;
   pitch: number;
   moving: boolean;
   sprinting: boolean;
   crouched: boolean;
   grounded: boolean;
   ads: boolean;
+  animState: string;
+  locomotionScale: number;
+  lowerBodyState: string | null;
+  lowerBodyLocomotionScale: number;
+  upperBodyState: string | null;
   alive: boolean;
 };
 
