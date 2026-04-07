@@ -1,105 +1,75 @@
 import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
 
-const nullableString = v.union(v.null(), v.string());
-const nullableNumber = v.union(v.null(), v.number());
-const nullableMatchId = v.union(v.null(), v.id("matches"));
-const nullableTeam = v.union(v.null(), v.union(v.literal("alpha"), v.literal("bravo")));
-
 export default defineSchema({
   users: defineTable({
-    authUserId: v.string(),
     username: v.string(),
-    displayName: v.string(),
-    createdAt: v.number(),
-    lastSeenAt: v.number(),
+    usernameNormalized: v.string(),
+    passwordHash: v.string(),
+    createdAt: v.string(),
+  }).index("by_username_normalized", ["usernameNormalized"]),
+
+  sessions: defineTable({
+    userId: v.id("users"),
+    tokenHash: v.string(),
+    createdAt: v.string(),
+    expiresAt: v.string(),
+    lastUsedAt: v.string(),
   })
-    .index("by_authUserId", ["authUserId"])
-    .index("by_username", ["username"]),
+    .index("by_token_hash", ["tokenHash"])
+    .index("by_user_id", ["userId"])
+    .index("by_expires_at", ["expiresAt"]),
 
   lobbies: defineTable({
     code: v.string(),
-    status: v.union(
-      v.literal("forming"),
-      v.literal("probing"),
-      v.literal("match_live"),
-      v.literal("closed"),
-    ),
-    mode: v.literal("tdm"),
-    mapId: v.string(),
+    hostUserId: v.id("users"),
+    status: v.union(v.literal("open"), v.literal("in_match")),
     maxPlayers: v.number(),
-    ownerUserId: v.string(),
-    hostUserId: nullableString,
-    matchId: nullableMatchId,
-    probeDeadlineAt: nullableNumber,
-    createdAt: v.number(),
-  }).index("by_code", ["code"]),
+    selectedMapId: v.string(),
+    createdAt: v.string(),
+    updatedAt: v.string(),
+    expiresAt: v.string(),
+    matchStartedAt: v.union(v.string(), v.null()),
+    hostAddress: v.union(v.string(), v.null()),
+    hostPort: v.union(v.number(), v.null()),
+    protocolVersion: v.union(v.number(), v.null()),
+    lastMatchEndedReason: v.union(
+      v.literal("host_disconnected"),
+      v.literal("player_disconnected"),
+      v.literal("host_left"),
+      v.literal("player_left"),
+      v.literal("host_ended_match"),
+      v.literal("player_ended_match"),
+      v.null(),
+    ),
+  })
+    .index("by_code", ["code"])
+    .index("by_expires_at", ["expiresAt"])
+    .index("by_host_user_id", ["hostUserId"]),
 
   lobbyMembers: defineTable({
     lobbyId: v.id("lobbies"),
-    userId: v.string(),
-    slot: v.number(),
-    ready: v.boolean(),
-    team: nullableTeam,
-    joinedAt: v.number(),
-    connectionState: v.union(v.literal("connected"), v.literal("disconnected")),
+    userId: v.id("users"),
+    isReady: v.boolean(),
+    selectedCharacterId: v.string(),
+    joinedAt: v.string(),
   })
-    .index("by_lobbyId", ["lobbyId"])
-    .index("by_lobbyId_userId", ["lobbyId", "userId"])
-    .index("by_userId", ["userId"]),
+    .index("by_lobby_id", ["lobbyId"])
+    .index("by_user_id", ["userId"])
+    .index("by_lobby_id_and_user_id", ["lobbyId", "userId"]),
 
-  probeResults: defineTable({
-    lobbyId: v.id("lobbies"),
-    sourceUserId: v.string(),
-    targetUserId: v.string(),
-    medianRttMs: v.number(),
-    maxRttMs: v.number(),
-    jitterMs: v.number(),
-    lossPct: v.number(),
-    sampledAt: v.number(),
+  lobbyPresence: defineTable({
+    lobbyCode: v.string(),
+    userId: v.id("users"),
+    lastSeenAt: v.number(),
   })
-    .index("by_lobbyId", ["lobbyId"])
-    .index("by_lobbyId_sourceUserId", ["lobbyId", "sourceUserId"])
-    .index("by_lobbyId_source_target", ["lobbyId", "sourceUserId", "targetUserId"]),
+    .index("by_lobby_code", ["lobbyCode"])
+    .index("by_lobby_code_and_user_id", ["lobbyCode", "userId"])
+    .index("by_user_id", ["userId"]),
 
-  matches: defineTable({
-    lobbyId: v.id("lobbies"),
-    hostUserId: v.string(),
-    status: v.union(
-      v.literal("pending"),
-      v.literal("live"),
-      v.literal("aborted"),
-      v.literal("completed"),
-    ),
-    startedAt: v.number(),
-    endedAt: nullableNumber,
-    scoreAlpha: v.number(),
-    scoreBravo: v.number(),
-    lastEventSeq: v.number(),
-  }).index("by_lobbyId", ["lobbyId"]),
-
-  matchPlayers: defineTable({
-    matchId: v.id("matches"),
-    userId: v.string(),
-    username: v.string(),
-    displayName: v.string(),
-    team: v.union(v.literal("alpha"), v.literal("bravo")),
-  })
-    .index("by_matchId", ["matchId"])
-    .index("by_matchId_userId", ["matchId", "userId"]),
-
-  matchEvents: defineTable({
-    matchId: v.id("matches"),
-    seq: v.number(),
-    type: v.string(),
-    actorUserId: nullableString,
-    victimUserId: nullableString,
-    weaponId: nullableString,
-    headshot: v.boolean(),
-    occurredAtMs: nullableNumber,
-    metadata: v.optional(v.any()),
-    serverTimestamp: v.number(),
-  })
-    .index("by_matchId", ["matchId"])
-    .index("by_matchId_seq", ["matchId", "seq"]),
+  matchRuntimes: defineTable({
+    lobbyCode: v.string(),
+    stateJson: v.string(),
+    latestShotJson: v.union(v.string(), v.null()),
+  }).index("by_lobby_code", ["lobbyCode"]),
 });

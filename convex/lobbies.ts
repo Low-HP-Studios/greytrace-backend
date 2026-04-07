@@ -1,504 +1,923 @@
-import {
-  MAX_LOBBY_PLAYERS,
-  PROBE_WINDOW_MS,
-  expectedProbeReportCount,
-  reportProbeInputSchema,
-  selectHostCandidate,
-} from "../packages/contracts/src";
-import { mutation, query } from "./_generated/server";
-import { ConvexError, v } from "convex/values";
-import { authComponent } from "./auth";
-import { ensureCurrentUserProfile } from "./lib/auth";
-import { abortLobbyMatch } from "./lib/matches";
-import {
-  buildLobbyView,
-  getLobbyByCodeDoc,
-  getMemberByUserId,
-  listLobbyMemberDocs,
-  nextOpenSlot,
-  resetMemberState,
-  reserveUniqueLobbyCode,
-} from "./lib/lobbies";
+import { v } from "convex/values";
+import { internalMutation, mutation, query } from "./_generated/server";
+import type { Id } from "./_generated/dataModel";
+import type { MutationCtx, QueryCtx } from "./_generated/server";
+import type {
+  ActiveMatchPayload,
+  LobbyPayload,
+  LobbyPlayer,
+  MatchEndedReason,
+} from "./domain";
+import { HttpError } from "./lib/httpError";
+import { createRoomCode } from "./lib/roomCode";
+import { normalizeLobbyCode } from "./lib/validation";
+import { LOBBY_TTL_MS, MAX_PLAYERS, PRESENCE_TTL_MS } from "./constants";
+import { requireAuthMutation, requireAuthQuery } from "./sessionHelpers";
+
+const MAX_PLAYERS_CONST = MAX_PLAYERS;
+const HOSTED_MATCH_PROTOCOL_VERSION = 1;
+
+function createExpiresAt(now: Date, ttlMs: number) {
+  return new Date(now.getTime() + ttlMs).toISOString();
+}
+
+function assertOpenLobby(lobby: {
+  status: "open" | "in_match";
+}) {
+  if (lobby.status !== "open") {
+    throw new HttpError(409, "Lobby is already in a match.");
+  }
+}
+
+function buildActiveMatch(
+  lobby: {
+    status: "open" | "in_match";
+    matchStartedAt: string | null;
+    hostUserId: Id<"users">;
+    hostAddress: string | null;
+    hostPort: number | null;
+    protocolVersion: number | null;
+  },
+  players: LobbyPlayer[],
+): ActiveMatchPayload | null {
+  if (
+    lobby.status !== "in_match" ||
+    !lobby.matchStartedAt ||
+    !lobby.hostAddress ||
+    lobby.hostPort === null ||
+    lobby.protocolVersion === null
+  ) {
+    return null;
+  }
+
+  return {
+    startedAt: lobby.matchStartedAt,
+    hostAddress: lobby.hostAddress,
+    hostPort: lobby.hostPort,
+    protocolVersion: lobby.protocolVersion,
+    slots: buildActiveMatchSlots(lobby.hostUserId, players),
+  };
+}
+
+function buildActiveMatchSlots(
+  hostUserId: Id<"users">,
+  players: LobbyPlayer[],
+): ActiveMatchPayload["slots"] {
+  const orderedPlayers = [...players].sort((left, right) => {
+    if (left.userId === hostUserId && right.userId !== hostUserId) {
+      return -1;
+    }
+    if (right.userId === hostUserId && left.userId !== hostUserId) {
+      return 1;
+    }
+    return left.joinedAt.localeCompare(right.joinedAt);
+  });
+
+  return orderedPlayers.map((player, index) => ({
+    userId: player.userId,
+    slotIndex: index,
+    selectedCharacterId: player.selectedCharacterId,
+  }));
+}
+
+function normalizeHostedMatchAddress(rawAddress: string) {
+  const hostAddress = rawAddress.trim();
+  if (!hostAddress) {
+    throw new HttpError(400, "Host address is required.");
+  }
+  if (hostAddress.length > 255) {
+    throw new HttpError(400, "Host address is too long.");
+  }
+  return hostAddress;
+}
+
+function normalizeHostedMatchPort(rawPort: number) {
+  if (!Number.isInteger(rawPort) || rawPort < 1 || rawPort > 65_535) {
+    throw new HttpError(400, "Host port must be between 1 and 65535.");
+  }
+  return rawPort;
+}
+
+async function findLobbyPlayers(
+  ctx: MutationCtx | QueryCtx,
+  lobbyId: Id<"lobbies">,
+): Promise<LobbyPlayer[]> {
+  const lobby = await ctx.db.get(lobbyId);
+  if (!lobby) {
+    return [];
+  }
+
+  const members = await ctx.db
+    .query("lobbyMembers")
+    .withIndex("by_lobby_id", (q) => q.eq("lobbyId", lobbyId))
+    .collect();
+
+  const sorted = [...members].sort((left, right) =>
+    left.joinedAt.localeCompare(right.joinedAt),
+  );
+
+  const players: LobbyPlayer[] = [];
+  for (const member of sorted) {
+    const user = await ctx.db.get(member.userId);
+    if (!user) {
+      continue;
+    }
+    players.push({
+      userId: member.userId,
+      username: user.username,
+      isHost: member.userId === lobby.hostUserId,
+      isReady: member.isReady,
+      joinedAt: member.joinedAt,
+      selectedCharacterId: member.selectedCharacterId,
+    });
+  }
+
+  return players;
+}
+
+async function getLobbyPayloadById(
+  ctx: MutationCtx | QueryCtx,
+  lobbyId: Id<"lobbies">,
+): Promise<LobbyPayload | null> {
+  const lobby = await ctx.db.get(lobbyId);
+  if (!lobby) {
+    return null;
+  }
+
+  const players = await findLobbyPlayers(ctx, lobbyId);
+
+  return {
+    code: lobby.code,
+    status: lobby.status,
+    hostUserId: lobby.hostUserId,
+    maxPlayers: MAX_PLAYERS_CONST,
+    selectedMapId: lobby.selectedMapId,
+    createdAt: lobby.createdAt,
+    expiresAt: lobby.expiresAt,
+    activeMatch: buildActiveMatch(lobby, players),
+    lastMatchEndedReason: lobby.lastMatchEndedReason,
+    players,
+  };
+}
+
+async function findActiveMembership(
+  ctx: MutationCtx | QueryCtx,
+  userId: Id<"users">,
+  nowIso: string,
+) {
+  const members = await ctx.db
+    .query("lobbyMembers")
+    .withIndex("by_user_id", (q) => q.eq("userId", userId))
+    .collect();
+
+  for (const member of members) {
+    const lobby = await ctx.db.get(member.lobbyId);
+    if (lobby && lobby.expiresAt > nowIso) {
+      return { lobbyId: member.lobbyId, code: lobby.code };
+    }
+  }
+
+  return undefined;
+}
+
+async function findLobbyByCode(
+  ctx: MutationCtx | QueryCtx,
+  rawCode: string,
+  nowIso: string,
+) {
+  const code = normalizeLobbyCode(rawCode);
+  const lobby = await ctx.db
+    .query("lobbies")
+    .withIndex("by_code", (q) => q.eq("code", code))
+    .unique();
+
+  if (!lobby || lobby.expiresAt <= nowIso) {
+    return undefined;
+  }
+
+  return lobby;
+}
+
+async function createUniqueRoomCode(ctx: MutationCtx) {
+  for (let attempt = 0; attempt < 25; attempt += 1) {
+    const code = createRoomCode();
+    const existing = await ctx.db
+      .query("lobbies")
+      .withIndex("by_code", (q) => q.eq("code", code))
+      .unique();
+
+    if (!existing) {
+      return code;
+    }
+  }
+
+  throw new HttpError(500, "Failed to generate a lobby code.");
+}
+
+async function resetLobbyReadyStates(ctx: MutationCtx, lobbyId: Id<"lobbies">) {
+  const members = await ctx.db
+    .query("lobbyMembers")
+    .withIndex("by_lobby_id", (q) => q.eq("lobbyId", lobbyId))
+    .collect();
+
+  for (const member of members) {
+    await ctx.db.patch(member._id, { isReady: false });
+  }
+}
+
+async function updateLobbyTimestamp(
+  ctx: MutationCtx,
+  lobbyId: Id<"lobbies">,
+  now: Date,
+) {
+  const lobby = await ctx.db.get(lobbyId);
+  if (!lobby) {
+    return;
+  }
+  const nowIso = now.toISOString();
+  await ctx.db.patch(lobbyId, {
+    updatedAt: nowIso,
+    expiresAt: createExpiresAt(now, LOBBY_TTL_MS),
+  });
+}
+
+async function setLobbyOpen(
+  ctx: MutationCtx,
+  lobbyId: Id<"lobbies">,
+  now: Date,
+  reason: MatchEndedReason | null = null,
+) {
+  const lobby = await ctx.db.get(lobbyId);
+  if (!lobby) {
+    return;
+  }
+  const nowIso = now.toISOString();
+  await ctx.db.patch(lobbyId, {
+    status: "open",
+    matchStartedAt: null,
+    hostAddress: null,
+    hostPort: null,
+    protocolVersion: null,
+    lastMatchEndedReason: reason,
+    updatedAt: nowIso,
+    expiresAt: createExpiresAt(now, LOBBY_TTL_MS),
+  });
+  await resetLobbyReadyStates(ctx, lobbyId);
+
+  const runtime = await ctx.db
+    .query("matchRuntimes")
+    .withIndex("by_lobby_code", (q) => q.eq("lobbyCode", lobby.code))
+    .unique();
+  if (runtime) {
+    await ctx.db.delete(runtime._id);
+  }
+}
+
+async function isUserPresent(
+  ctx: MutationCtx,
+  userId: Id<"users">,
+  lobbyCode: string,
+  nowMs: number,
+) {
+  const presence = await ctx.db
+    .query("lobbyPresence")
+    .withIndex("by_lobby_code_and_user_id", (q) =>
+      q.eq("lobbyCode", lobbyCode).eq("userId", userId),
+    )
+    .unique();
+
+  if (!presence) {
+    return false;
+  }
+  return nowMs - presence.lastSeenAt <= PRESENCE_TTL_MS;
+}
+
+export const getCurrentLobby = query({
+  args: { sessionToken: v.string() },
+  handler: async (ctx, args) => {
+    const auth = await requireAuthQuery(ctx, args.sessionToken);
+    const nowIso = new Date().toISOString();
+    const membership = await findActiveMembership(ctx, auth.userId, nowIso);
+    if (!membership) {
+      return { lobby: null as LobbyPayload | null };
+    }
+    const lobby = await getLobbyPayloadById(ctx, membership.lobbyId);
+    return { lobby };
+  },
+});
+
+export const getLobby = query({
+  args: {
+    sessionToken: v.string(),
+    code: v.string(),
+  },
+  handler: async (ctx, args) => {
+    await requireAuthQuery(ctx, args.sessionToken);
+    const nowIso = new Date().toISOString();
+    const lobbyRow = await findLobbyByCode(ctx, args.code, nowIso);
+    if (!lobbyRow) {
+      throw new HttpError(404, "Lobby not found.");
+    }
+    const lobby = await getLobbyPayloadById(ctx, lobbyRow._id);
+    if (!lobby) {
+      throw new HttpError(404, "Lobby not found.");
+    }
+    return lobby;
+  },
+});
+
+export const leaveCurrentInternal = internalMutation({
+  args: { userId: v.id("users") },
+  handler: async (ctx, args) => {
+    const presenceRows = await ctx.db
+      .query("lobbyPresence")
+      .withIndex("by_user_id", (q) => q.eq("userId", args.userId))
+      .collect();
+
+    for (const row of presenceRows) {
+      await ctx.db.delete(row._id);
+    }
+
+    const nowIso = new Date().toISOString();
+    const membership = await findActiveMembership(ctx, args.userId, nowIso);
+    if (!membership) {
+      return null;
+    }
+
+    await leaveLobbyImpl(ctx, args.userId, membership.code, new Date());
+    return null;
+  },
+});
+
+async function leaveLobbyImpl(
+  ctx: MutationCtx,
+  userId: Id<"users">,
+  rawCode: string,
+  now: Date,
+): Promise<{
+  code: string;
+  lobby: LobbyPayload | null;
+  matchEndedReason: MatchEndedReason | null;
+}> {
+  const nowIso = now.toISOString();
+  const lobby = await findLobbyByCode(ctx, rawCode, nowIso);
+  if (!lobby) {
+    throw new HttpError(404, "Lobby not found.");
+  }
+
+  const membership = await ctx.db
+    .query("lobbyMembers")
+    .withIndex("by_lobby_id_and_user_id", (q) =>
+      q.eq("lobbyId", lobby._id).eq("userId", userId),
+    )
+    .unique();
+
+  if (!membership) {
+    throw new HttpError(404, "You are not in that lobby.");
+  }
+
+  const wasInMatch = lobby.status === "in_match";
+
+  await ctx.db.delete(membership._id);
+
+  const remaining = await ctx.db
+    .query("lobbyMembers")
+    .withIndex("by_lobby_id", (q) => q.eq("lobbyId", lobby._id))
+    .collect();
+
+  const remainingSorted = [...remaining].sort((left, right) =>
+    left.joinedAt.localeCompare(right.joinedAt),
+  );
+
+  if (remainingSorted.length === 0) {
+    const runtime = await ctx.db
+      .query("matchRuntimes")
+      .withIndex("by_lobby_code", (q) => q.eq("lobbyCode", lobby.code))
+      .unique();
+    if (runtime) {
+      await ctx.db.delete(runtime._id);
+    }
+    await ctx.db.delete(lobby._id);
+    return {
+      code: lobby.code,
+      lobby: null,
+      matchEndedReason: wasInMatch
+        ? userId === lobby.hostUserId
+          ? "host_left"
+          : "player_left"
+        : null,
+    };
+  }
+
+  const nextHost =
+    lobby.hostUserId === userId ? remainingSorted[0]!.userId : lobby.hostUserId;
+
+  await ctx.db.patch(lobby._id, {
+    hostUserId: nextHost,
+    status: wasInMatch ? "open" : lobby.status,
+    matchStartedAt: null,
+    hostAddress: null,
+    hostPort: null,
+    protocolVersion: null,
+    lastMatchEndedReason: wasInMatch
+      ? (userId === lobby.hostUserId ? "host_left" : "player_left")
+      : null,
+    updatedAt: now.toISOString(),
+    expiresAt: createExpiresAt(now, LOBBY_TTL_MS),
+  });
+
+  if (wasInMatch) {
+    await resetLobbyReadyStates(ctx, lobby._id);
+  }
+
+  const runtime = await ctx.db
+    .query("matchRuntimes")
+    .withIndex("by_lobby_code", (q) => q.eq("lobbyCode", lobby.code))
+    .unique();
+  if (runtime) {
+    await ctx.db.delete(runtime._id);
+  }
+
+  return {
+    code: lobby.code,
+    lobby: await getLobbyPayloadById(ctx, lobby._id),
+    matchEndedReason: wasInMatch
+      ? userId === lobby.hostUserId
+        ? "host_left"
+        : "player_left"
+      : null,
+  };
+}
 
 export const createLobby = mutation({
   args: {
-    mapId: v.string(),
+    sessionToken: v.string(),
+    maxPlayers: v.literal(2),
+    selectedCharacterId: v.string(),
+    selectedMapId: v.string(),
   },
   handler: async (ctx, args) => {
-    const user = await ensureCurrentUserProfile(ctx);
-    const now = Date.now();
-    const code = await reserveUniqueLobbyCode(ctx);
-    const lobbyId = await ctx.db.insert("lobbies", {
-      code,
-      status: "forming",
-      mode: "tdm",
-      mapId: args.mapId,
-      maxPlayers: MAX_LOBBY_PLAYERS,
-      ownerUserId: user.authUserId,
-      hostUserId: null,
-      matchId: null,
-      probeDeadlineAt: null,
-      createdAt: now,
-    });
-
-    await ctx.db.insert("lobbyMembers", {
-      lobbyId,
-      userId: user.authUserId,
-      slot: 0,
-      ready: false,
-      team: null,
-      joinedAt: now,
-      connectionState: "connected",
-    });
-
-    const lobby = await ctx.db.get(lobbyId);
-    if (!lobby) {
-      throw new ConvexError("Lobby creation failed");
+    const auth = await requireAuthMutation(ctx, args.sessionToken);
+    if (args.maxPlayers !== MAX_PLAYERS_CONST) {
+      throw new HttpError(400, "Only 2-player lobbies are supported right now.");
     }
 
-    return await buildLobbyView(ctx, lobby);
-  },
-});
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const existingMembership = await findActiveMembership(ctx, auth.userId, nowIso);
+    if (existingMembership) {
+      throw new HttpError(409, "You are already in an active lobby.");
+    }
 
-export const getLobbyByCode = query({
-  args: {
-    code: v.string(),
-  },
-  handler: async (ctx, args) => {
-    await authComponent.getAuthUser(ctx);
-    const lobby = await getLobbyByCodeDoc(ctx, args.code);
-    return {
-      id: lobby._id,
-      code: lobby.code,
-      status: lobby.status,
-      mode: lobby.mode,
-      mapId: lobby.mapId,
-      maxPlayers: lobby.maxPlayers,
-      ownerUserId: lobby.ownerUserId,
-      hostUserId: lobby.hostUserId,
-      matchId: lobby.matchId,
-      createdAt: lobby.createdAt,
-    };
-  },
-});
+    const code = await createUniqueRoomCode(ctx);
 
-export const listLobbyMembers = query({
-  args: {
-    code: v.string(),
-  },
-  handler: async (ctx, args) => {
-    await authComponent.getAuthUser(ctx);
-    const lobby = await getLobbyByCodeDoc(ctx, args.code);
-    return (await buildLobbyView(ctx, lobby)).members;
-  },
-});
+    await ctx.db.insert("lobbies", {
+      code,
+      hostUserId: auth.userId,
+      status: "open",
+      maxPlayers: MAX_PLAYERS_CONST,
+      selectedMapId: args.selectedMapId,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      expiresAt: createExpiresAt(now, LOBBY_TTL_MS),
+      matchStartedAt: null,
+      hostAddress: null,
+      hostPort: null,
+      protocolVersion: null,
+      lastMatchEndedReason: null,
+    });
 
-export const getLobbyView = query({
-  args: {
-    code: v.string(),
-  },
-  handler: async (ctx, args) => {
-    await authComponent.getAuthUser(ctx);
-    const lobby = await getLobbyByCodeDoc(ctx, args.code);
-    return await buildLobbyView(ctx, lobby);
+    const inserted = await ctx.db
+      .query("lobbies")
+      .withIndex("by_code", (q) => q.eq("code", code))
+      .unique();
+    if (!inserted) {
+      throw new HttpError(500, "Lobby creation failed.");
+    }
+
+    await ctx.db.insert("lobbyMembers", {
+      lobbyId: inserted._id,
+      userId: auth.userId,
+      isReady: false,
+      selectedCharacterId: args.selectedCharacterId,
+      joinedAt: nowIso,
+    });
+
+    return await getLobbyPayloadById(ctx, inserted._id);
   },
 });
 
 export const joinLobby = mutation({
   args: {
+    sessionToken: v.string(),
     code: v.string(),
+    selectedCharacterId: v.string(),
   },
   handler: async (ctx, args) => {
-    const user = await ensureCurrentUserProfile(ctx);
-    const lobby = await getLobbyByCodeDoc(ctx, args.code);
-    if (lobby.status !== "forming") {
-      throw new ConvexError("Lobby is not accepting joins");
+    const auth = await requireAuthMutation(ctx, args.sessionToken);
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const code = normalizeLobbyCode(args.code);
+
+    const lobby = await findLobbyByCode(ctx, code, nowIso);
+    if (!lobby) {
+      throw new HttpError(404, "Lobby not found.");
     }
+    assertOpenLobby(lobby);
 
-    const members = await listLobbyMemberDocs(ctx, lobby._id);
-    const existingMember = getMemberByUserId(members, user.authUserId);
-
-    if (existingMember) {
-      await ctx.db.patch(existingMember._id, {
-        connectionState: "connected",
-      });
-      const refreshedLobby = await ctx.db.get(lobby._id);
-      if (!refreshedLobby) {
-        throw new ConvexError("Lobby not found");
+    const currentMembership = await findActiveMembership(ctx, auth.userId, nowIso);
+    if (currentMembership) {
+      if (currentMembership.code === code) {
+        return await getLobbyPayloadById(ctx, currentMembership.lobbyId);
       }
-      return await buildLobbyView(ctx, refreshedLobby);
+      throw new HttpError(409, "You are already in an active lobby.");
     }
 
-    if (members.length >= MAX_LOBBY_PLAYERS) {
-      throw new ConvexError("Lobby is full");
+    const refreshedLobby = await findLobbyByCode(ctx, code, nowIso);
+    if (!refreshedLobby) {
+      throw new HttpError(404, "Lobby not found.");
+    }
+    assertOpenLobby(refreshedLobby);
+
+    const members = await ctx.db
+      .query("lobbyMembers")
+      .withIndex("by_lobby_id", (q) => q.eq("lobbyId", refreshedLobby._id))
+      .collect();
+
+    if (members.length >= refreshedLobby.maxPlayers) {
+      throw new HttpError(409, "Lobby is full.");
     }
 
     await ctx.db.insert("lobbyMembers", {
-      lobbyId: lobby._id,
-      userId: user.authUserId,
-      slot: nextOpenSlot(members),
-      ready: false,
-      team: null,
-      joinedAt: Date.now(),
-      connectionState: "connected",
+      lobbyId: refreshedLobby._id,
+      userId: auth.userId,
+      isReady: false,
+      selectedCharacterId: args.selectedCharacterId,
+      joinedAt: nowIso,
     });
 
-    const nextMembers = await listLobbyMemberDocs(ctx, lobby._id);
-    await resetMemberState(ctx, nextMembers, {
-      ready: false,
-      clearTeams: true,
+    await ctx.db.patch(refreshedLobby._id, {
+      updatedAt: nowIso,
+      expiresAt: createExpiresAt(now, LOBBY_TTL_MS),
     });
 
-    const refreshedLobby = await ctx.db.get(lobby._id);
-    if (!refreshedLobby) {
-      throw new ConvexError("Lobby not found");
-    }
-    return await buildLobbyView(ctx, refreshedLobby);
-  },
-});
-
-export const leaveLobby = mutation({
-  args: {
-    code: v.string(),
-  },
-  handler: async (ctx, args) => {
-    const user = await ensureCurrentUserProfile(ctx);
-    const lobby = await getLobbyByCodeDoc(ctx, args.code);
-    if (lobby.status === "match_live") {
-      throw new ConvexError("Cannot leave a live match through lobby leave");
-    }
-
-    const members = await listLobbyMemberDocs(ctx, lobby._id);
-    const member = getMemberByUserId(members, user.authUserId);
-    if (!member) {
-      throw new ConvexError("User is not in the lobby");
-    }
-
-    await ctx.db.delete(member._id);
-    const remainingMembers = await listLobbyMemberDocs(ctx, lobby._id);
-
-    if (remainingMembers.length === 0) {
-      await ctx.db.patch(lobby._id, {
-        status: "closed",
-        ownerUserId: lobby.ownerUserId,
-        hostUserId: null,
-        matchId: null,
-        probeDeadlineAt: null,
-      });
-    } else {
-      const nextOwner =
-        remainingMembers.sort((left, right) => left.joinedAt - right.joinedAt)[0]
-          ?.userId ?? lobby.ownerUserId;
-      await resetMemberState(ctx, remainingMembers, {
-        ready: false,
-        clearTeams: true,
-      });
-      await ctx.db.patch(lobby._id, {
-        ownerUserId: nextOwner,
-        hostUserId:
-          lobby.hostUserId && lobby.hostUserId !== user.authUserId
-            ? lobby.hostUserId
-            : null,
-        probeDeadlineAt: null,
-      });
-    }
-
-    const refreshedLobby = await ctx.db.get(lobby._id);
-    if (!refreshedLobby) {
-      throw new ConvexError("Lobby not found");
-    }
-    return await buildLobbyView(ctx, refreshedLobby);
+    return await getLobbyPayloadById(ctx, refreshedLobby._id);
   },
 });
 
 export const setReady = mutation({
   args: {
+    sessionToken: v.string(),
     code: v.string(),
     ready: v.boolean(),
   },
   handler: async (ctx, args) => {
-    const user = await ensureCurrentUserProfile(ctx);
-    const lobby = await getLobbyByCodeDoc(ctx, args.code);
-    if (lobby.status !== "forming") {
-      throw new ConvexError("Lobby is not in a ready state");
+    const auth = await requireAuthMutation(ctx, args.sessionToken);
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const lobby = await findLobbyByCode(ctx, args.code, nowIso);
+    if (!lobby) {
+      throw new HttpError(404, "Lobby not found.");
+    }
+    assertOpenLobby(lobby);
+
+    const member = await ctx.db
+      .query("lobbyMembers")
+      .withIndex("by_lobby_id_and_user_id", (q) =>
+        q.eq("lobbyId", lobby._id).eq("userId", auth.userId),
+      )
+      .unique();
+
+    if (!member) {
+      throw new HttpError(404, "You are not in that lobby.");
     }
 
-    const members = await listLobbyMemberDocs(ctx, lobby._id);
-    const member = getMemberByUserId(members, user.authUserId);
+    await ctx.db.patch(member._id, { isReady: args.ready });
+    await updateLobbyTimestamp(ctx, lobby._id, now);
+    return await getLobbyPayloadById(ctx, lobby._id);
+  },
+});
+
+export const setCharacter = mutation({
+  args: {
+    sessionToken: v.string(),
+    code: v.string(),
+    selectedCharacterId: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const auth = await requireAuthMutation(ctx, args.sessionToken);
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const lobby = await findLobbyByCode(ctx, args.code, nowIso);
+    if (!lobby) {
+      throw new HttpError(404, "Lobby not found.");
+    }
+    assertOpenLobby(lobby);
+
+    const member = await ctx.db
+      .query("lobbyMembers")
+      .withIndex("by_lobby_id_and_user_id", (q) =>
+        q.eq("lobbyId", lobby._id).eq("userId", auth.userId),
+      )
+      .unique();
+
     if (!member) {
-      throw new ConvexError("User is not in the lobby");
+      throw new HttpError(404, "You are not in that lobby.");
     }
 
     await ctx.db.patch(member._id, {
-      ready: args.ready,
+      selectedCharacterId: args.selectedCharacterId,
+      isReady: false,
     });
-
-    const refreshedLobby = await ctx.db.get(lobby._id);
-    if (!refreshedLobby) {
-      throw new ConvexError("Lobby not found");
-    }
-    return await buildLobbyView(ctx, refreshedLobby);
+    await updateLobbyTimestamp(ctx, lobby._id, now);
+    return await getLobbyPayloadById(ctx, lobby._id);
   },
 });
 
-export const startProbe = mutation({
+export const setMap = mutation({
   args: {
+    sessionToken: v.string(),
     code: v.string(),
+    selectedMapId: v.string(),
   },
   handler: async (ctx, args) => {
-    const user = await ensureCurrentUserProfile(ctx);
-    const lobby = await getLobbyByCodeDoc(ctx, args.code);
-    if (lobby.status !== "forming") {
-      throw new ConvexError("Lobby is not ready for probing");
+    const auth = await requireAuthMutation(ctx, args.sessionToken);
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const lobby = await findLobbyByCode(ctx, args.code, nowIso);
+    if (!lobby) {
+      throw new HttpError(404, "Lobby not found.");
     }
+    assertOpenLobby(lobby);
 
-    const members = await listLobbyMemberDocs(ctx, lobby._id);
-    if (!getMemberByUserId(members, user.authUserId)) {
-      throw new ConvexError("User is not in the lobby");
+    if (lobby.hostUserId !== auth.userId) {
+      throw new HttpError(403, "Only the host can change the map.");
     }
-
-    if (members.length !== MAX_LOBBY_PLAYERS) {
-      throw new ConvexError("Exactly six players are required to start probing");
-    }
-
-    if (
-      members.some(
-        (member) =>
-          member.connectionState !== "connected" ||
-          member.ready !== true,
-      )
-    ) {
-      throw new ConvexError("All lobby members must be connected and ready");
-    }
-
-    const existingProbeResults = await ctx.db
-      .query("probeResults")
-      .withIndex("by_lobbyId", (query) => query.eq("lobbyId", lobby._id))
-      .collect();
-
-    await Promise.all(
-      existingProbeResults.map(async (probeResult) => {
-        await ctx.db.delete(probeResult._id);
-      }),
-    );
 
     await ctx.db.patch(lobby._id, {
-      status: "probing",
-      hostUserId: null,
-      probeDeadlineAt: Date.now() + PROBE_WINDOW_MS,
+      selectedMapId: args.selectedMapId,
+      updatedAt: nowIso,
+      expiresAt: createExpiresAt(now, LOBBY_TTL_MS),
     });
-
-    const refreshedLobby = await ctx.db.get(lobby._id);
-    if (!refreshedLobby) {
-      throw new ConvexError("Lobby not found");
-    }
-    return await buildLobbyView(ctx, refreshedLobby);
+    await resetLobbyReadyStates(ctx, lobby._id);
+    return await getLobbyPayloadById(ctx, lobby._id);
   },
 });
 
-export const storeProbeResult = mutation({
+export const startMatch = mutation({
   args: {
+    sessionToken: v.string(),
     code: v.string(),
-    targetUserId: v.string(),
-    medianRttMs: v.number(),
-    maxRttMs: v.number(),
-    jitterMs: v.number(),
-    lossPct: v.number(),
+    hostAddress: v.string(),
+    hostPort: v.number(),
   },
   handler: async (ctx, args) => {
-    const parsed = reportProbeInputSchema.safeParse(args);
-    if (!parsed.success) {
-      throw new ConvexError(parsed.error.flatten().fieldErrors);
+    const auth = await requireAuthMutation(ctx, args.sessionToken);
+    const now = new Date();
+    const nowMs = now.getTime();
+    const nowIso = now.toISOString();
+    const hostAddress = normalizeHostedMatchAddress(args.hostAddress);
+    const hostPort = normalizeHostedMatchPort(args.hostPort);
+    const lobby = await findLobbyByCode(ctx, args.code, nowIso);
+    if (!lobby) {
+      throw new HttpError(404, "Lobby not found.");
+    }
+    assertOpenLobby(lobby);
+
+    if (lobby.hostUserId !== auth.userId) {
+      throw new HttpError(403, "Only the host can start the match.");
     }
 
-    const user = await ensureCurrentUserProfile(ctx);
-    const lobby = await getLobbyByCodeDoc(ctx, args.code);
-    if (lobby.status !== "probing") {
-      throw new ConvexError("Lobby is not accepting probe results");
+    const players = await findLobbyPlayers(ctx, lobby._id);
+    if (players.length !== 2) {
+      throw new HttpError(409, "Both players must be in the lobby before starting.");
     }
 
-    const members = await listLobbyMemberDocs(ctx, lobby._id);
-    if (!getMemberByUserId(members, user.authUserId)) {
-      throw new ConvexError("User is not in the lobby");
+    if (players.some((player) => !player.isReady)) {
+      throw new HttpError(409, "Both players must be ready before starting.");
     }
 
-    if (user.authUserId === args.targetUserId) {
-      throw new ConvexError("Users cannot report probe results against themselves");
+    if (players.some((player) => !player.selectedCharacterId)) {
+      throw new HttpError(409, "Both players must lock a character before starting.");
     }
 
-    if (!getMemberByUserId(members, args.targetUserId)) {
-      throw new ConvexError("Probe target is not in the lobby");
-    }
-
-    const existing = await ctx.db
-      .query("probeResults")
-      .withIndex("by_lobbyId", (query) => query.eq("lobbyId", lobby._id))
-      .collect()
-      .then((results) =>
-        results.find(
-          (result) =>
-            result.sourceUserId === user.authUserId &&
-            result.targetUserId === args.targetUserId,
-        ) ?? null,
+    const normalizedCode = normalizeLobbyCode(lobby.code);
+    for (const player of players) {
+      const present = await isUserPresent(
+        ctx,
+        player.userId as Id<"users">,
+        normalizedCode,
+        nowMs,
       );
-
-    const payload = {
-      lobbyId: lobby._id,
-      sourceUserId: user.authUserId,
-      targetUserId: args.targetUserId,
-      medianRttMs: args.medianRttMs,
-      maxRttMs: args.maxRttMs,
-      jitterMs: args.jitterMs,
-      lossPct: args.lossPct,
-      sampledAt: Date.now(),
-    };
-
-    if (existing) {
-      await ctx.db.patch(existing._id, payload);
-    } else {
-      await ctx.db.insert("probeResults", payload);
+      if (!present) {
+        throw new HttpError(
+          409,
+          "Both players must be connected to realtime before starting.",
+        );
+      }
     }
 
-    const refreshedLobby = await ctx.db.get(lobby._id);
-    if (!refreshedLobby) {
-      throw new ConvexError("Lobby not found");
+    if (lobby.selectedMapId !== "map1") {
+      throw new HttpError(
+        409,
+        "Live multiplayer combat is only wired for map1 right now.",
+      );
     }
-    return await buildLobbyView(ctx, refreshedLobby);
+
+    await ctx.db.patch(lobby._id, {
+      status: "in_match",
+      matchStartedAt: nowIso,
+      hostAddress,
+      hostPort,
+      protocolVersion: HOSTED_MATCH_PROTOCOL_VERSION,
+      lastMatchEndedReason: null,
+      updatedAt: nowIso,
+      expiresAt: createExpiresAt(now, LOBBY_TTL_MS),
+    });
+
+    return { ok: true as const };
   },
 });
 
-export const selectHost = mutation({
-  args: {
-    code: v.string(),
-  },
+export const endMatch = mutation({
+  args: { sessionToken: v.string(), code: v.string() },
   handler: async (ctx, args) => {
-    const user = await ensureCurrentUserProfile(ctx);
-    const lobby = await getLobbyByCodeDoc(ctx, args.code);
-    const members = await listLobbyMemberDocs(ctx, lobby._id);
-
-    if (!getMemberByUserId(members, user.authUserId)) {
-      throw new ConvexError("User is not in the lobby");
+    const auth = await requireAuthMutation(ctx, args.sessionToken);
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const lobby = await findLobbyByCode(ctx, args.code, nowIso);
+    if (!lobby) {
+      throw new HttpError(404, "Lobby not found.");
     }
 
-    if (lobby.status !== "probing") {
-      throw new ConvexError("Lobby is not in probe mode");
+    const membership = await ctx.db
+      .query("lobbyMembers")
+      .withIndex("by_lobby_id_and_user_id", (q) =>
+        q.eq("lobbyId", lobby._id).eq("userId", auth.userId),
+      )
+      .unique();
+
+    if (!membership) {
+      throw new HttpError(404, "You are not in that lobby.");
     }
 
-    if (members.length !== MAX_LOBBY_PLAYERS) {
-      throw new ConvexError("Lobby must still have six players");
+    if (lobby.status === "open") {
+      return {
+        ok: true as const,
+        code: lobby.code,
+        lobby: await getLobbyPayloadById(ctx, lobby._id),
+        matchEndedReason: null as MatchEndedReason | null,
+      };
     }
 
-    const probeResults = await ctx.db
-      .query("probeResults")
-      .withIndex("by_lobbyId", (query) => query.eq("lobbyId", lobby._id))
-      .collect();
+    const matchEndedReason =
+      auth.userId === lobby.hostUserId ? "host_ended_match" : "player_ended_match";
 
-    if (probeResults.length !== expectedProbeReportCount(MAX_LOBBY_PLAYERS)) {
-      throw new ConvexError("Probe result matrix is incomplete");
-    }
-
-    const { hostUserId, scores } = selectHostCandidate({
-      candidates: members.map((member) => ({
-        userId: member.userId,
-        joinedAt: member.joinedAt,
-      })),
-      probes: probeResults.map((probe) => ({
-        sourceUserId: probe.sourceUserId,
-        targetUserId: probe.targetUserId,
-        medianRttMs: probe.medianRttMs,
-        maxRttMs: probe.maxRttMs,
-        jitterMs: probe.jitterMs,
-        lossPct: probe.lossPct,
-      })),
-    });
-
-    await ctx.db.patch(lobby._id, {
-      hostUserId,
-    });
-
-    const refreshedLobby = await ctx.db.get(lobby._id);
-    if (!refreshedLobby) {
-      throw new ConvexError("Lobby not found");
-    }
+    await setLobbyOpen(ctx, lobby._id, now, matchEndedReason);
 
     return {
-      lobby: await buildLobbyView(ctx, refreshedLobby),
-      scores,
+      ok: true as const,
+      code: lobby.code,
+      lobby: await getLobbyPayloadById(ctx, lobby._id),
+      matchEndedReason,
     };
   },
 });
 
-export const upsertPresence = mutation({
+export const finalizeHostedMatch = mutation({
   args: {
-    lobbyCode: v.optional(v.string()),
-    connectionState: v.optional(
-      v.union(v.literal("connected"), v.literal("disconnected")),
+    sessionToken: v.string(),
+    code: v.string(),
+    reason: v.union(
+      v.literal("host_disconnected"),
+      v.literal("player_disconnected"),
+      v.literal("host_left"),
+      v.literal("player_left"),
+      v.literal("host_ended_match"),
+      v.literal("player_ended_match"),
     ),
   },
   handler: async (ctx, args) => {
-    const user = await ensureCurrentUserProfile(ctx);
-
-    if (!args.lobbyCode || !args.connectionState) {
-      return user;
+    const auth = await requireAuthMutation(ctx, args.sessionToken);
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const lobby = await findLobbyByCode(ctx, args.code, nowIso);
+    if (!lobby) {
+      throw new HttpError(404, "Lobby not found.");
     }
 
-    const lobby = await getLobbyByCodeDoc(ctx, args.lobbyCode);
-    const members = await listLobbyMemberDocs(ctx, lobby._id);
-    const member = getMemberByUserId(members, user.authUserId);
+    const membership = await ctx.db
+      .query("lobbyMembers")
+      .withIndex("by_lobby_id_and_user_id", (q) =>
+        q.eq("lobbyId", lobby._id).eq("userId", auth.userId),
+      )
+      .unique();
 
-    if (!member) {
-      return user;
+    if (!membership) {
+      throw new HttpError(404, "You are not in that lobby.");
     }
 
-    await ctx.db.patch(member._id, {
-      connectionState: args.connectionState,
-    });
-
-    if (
-      args.connectionState === "disconnected" &&
-      lobby.status === "match_live" &&
-      lobby.hostUserId === user.authUserId
-    ) {
-      await abortLobbyMatch(
-        ctx,
-        lobby,
-        "The host disconnected. Match aborted and lobby reset.",
-      );
+    if (lobby.status === "open") {
+      return {
+        ok: true as const,
+        code: lobby.code,
+        lobby: await getLobbyPayloadById(ctx, lobby._id),
+        matchEndedReason: lobby.lastMatchEndedReason,
+      };
     }
 
-    return user;
+    await setLobbyOpen(ctx, lobby._id, now, args.reason);
+
+    return {
+      ok: true as const,
+      code: lobby.code,
+      lobby: await getLobbyPayloadById(ctx, lobby._id),
+      matchEndedReason: args.reason as MatchEndedReason,
+    };
   },
 });
 
-export const closeLobby = mutation({
-  args: {
-    code: v.string(),
-  },
+export const leaveLobby = mutation({
+  args: { sessionToken: v.string(), code: v.string() },
   handler: async (ctx, args) => {
-    const user = await ensureCurrentUserProfile(ctx);
-    const lobby = await getLobbyByCodeDoc(ctx, args.code);
-    if (lobby.ownerUserId !== user.authUserId) {
-      throw new ConvexError("Only the lobby owner can close the lobby");
+    const auth = await requireAuthMutation(ctx, args.sessionToken);
+    const result = await leaveLobbyImpl(ctx, auth.userId, args.code, new Date());
+    return { ok: true as const, ...result };
+  },
+});
+
+export const disbandLobby = mutation({
+  args: { sessionToken: v.string(), code: v.string() },
+  handler: async (ctx, args) => {
+    const auth = await requireAuthMutation(ctx, args.sessionToken);
+    const nowIso = new Date().toISOString();
+    const lobby = await findLobbyByCode(ctx, args.code, nowIso);
+    if (!lobby) {
+      throw new HttpError(404, "Lobby not found.");
     }
 
-    const members = await listLobbyMemberDocs(ctx, lobby._id);
-    await Promise.all(
-      members.map(async (member) => {
-        await ctx.db.delete(member._id);
-      }),
-    );
-
-    await ctx.db.patch(lobby._id, {
-      status: "closed",
-      hostUserId: null,
-      matchId: null,
-      probeDeadlineAt: null,
-    });
-
-    const refreshedLobby = await ctx.db.get(lobby._id);
-    if (!refreshedLobby) {
-      throw new ConvexError("Lobby not found");
+    if (lobby.hostUserId !== auth.userId) {
+      throw new HttpError(403, "Only the host can disband the lobby.");
     }
-    return await buildLobbyView(ctx, refreshedLobby);
+
+    const members = await ctx.db
+      .query("lobbyMembers")
+      .withIndex("by_lobby_id", (q) => q.eq("lobbyId", lobby._id))
+      .collect();
+
+    for (const member of members) {
+      await ctx.db.delete(member._id);
+    }
+
+    const runtime = await ctx.db
+      .query("matchRuntimes")
+      .withIndex("by_lobby_code", (q) => q.eq("lobbyCode", lobby.code))
+      .unique();
+    if (runtime) {
+      await ctx.db.delete(runtime._id);
+    }
+
+    await ctx.db.delete(lobby._id);
+
+    return {
+      ok: true as const,
+      code: lobby.code,
+      lobby: null,
+      matchEndedReason: lobby.status === "in_match" ? ("host_left" as const) : null,
+    };
+  },
+});
+
+export const handleDisconnect = mutation({
+  args: { sessionToken: v.string(), code: v.string() },
+  handler: async (ctx, args) => {
+    const auth = await requireAuthMutation(ctx, args.sessionToken);
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const lobby = await findLobbyByCode(ctx, args.code, nowIso);
+    if (!lobby || lobby.status !== "in_match") {
+      return null;
+    }
+
+    const membership = await ctx.db
+      .query("lobbyMembers")
+      .withIndex("by_lobby_id_and_user_id", (q) =>
+        q.eq("lobbyId", lobby._id).eq("userId", auth.userId),
+      )
+      .unique();
+
+    if (!membership) {
+      return null;
+    }
+
+    const matchEndedReason =
+      auth.userId === lobby.hostUserId ? "host_disconnected" : "player_disconnected";
+    await setLobbyOpen(ctx, lobby._id, now, matchEndedReason);
+
+    return {
+      code: lobby.code,
+      lobby: await getLobbyPayloadById(ctx, lobby._id),
+      matchEndedReason,
+    };
   },
 });
