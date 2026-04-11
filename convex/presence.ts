@@ -1,3 +1,5 @@
+// DEPRECATED: greytrace-backend is retired; do not use.
+
 import { v } from "convex/values";
 import { mutation } from "./_generated/server";
 import { HttpError } from "./lib/httpError";

@@ -1,3 +1,5 @@
+// DEPRECATED: greytrace-backend is retired; do not use.
+
 import type {
   LobbyPayload,
   MatchHitZone,

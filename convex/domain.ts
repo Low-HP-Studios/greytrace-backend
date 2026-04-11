@@ -1,3 +1,5 @@
+// DEPRECATED: greytrace-backend is retired; do not use.
+
 export type PublicUser = {
   id: string;
   username: string;

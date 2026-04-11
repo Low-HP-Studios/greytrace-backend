@@ -1,3 +1,5 @@
+**Repository status:** Deprecated. **greytrace-backend** is retired and not maintained. Do not deploy it, build new features on it, or rely on it for production.
+
 <!-- convex-ai-start -->
 This project uses [Convex](https://convex.dev) as its backend.
 

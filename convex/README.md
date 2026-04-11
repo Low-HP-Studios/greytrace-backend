@@ -1,3 +1,9 @@
+# greytrace-backend (Convex) — **deprecated**
+
+This repository is **retired** and **not maintained**. Do not deploy or depend on this codebase.
+
+---
+
 # Welcome to your Convex functions directory!
 
 Write your Convex functions here.

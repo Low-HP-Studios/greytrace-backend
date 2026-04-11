@@ -1,3 +1,5 @@
+// DEPRECATED: greytrace-backend is retired; do not use.
+
 const ROOM_CODE_CHARSET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 function randomInt(max: number) {

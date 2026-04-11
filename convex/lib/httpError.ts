@@ -1,3 +1,5 @@
+// DEPRECATED: greytrace-backend is retired; do not use.
+
 import { ConvexError } from "convex/values";
 
 export type HttpErrorData = {

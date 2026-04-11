@@ -1,3 +1,5 @@
+// DEPRECATED: greytrace-backend is retired; do not use.
+
 export async function hashTokenHex(token: string): Promise<string> {
   const data = new TextEncoder().encode(token.trim());
   const hash = await crypto.subtle.digest("SHA-256", data);

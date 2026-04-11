@@ -1,3 +1,5 @@
+// DEPRECATED: greytrace-backend is retired; do not use.
+
 import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
 

@@ -1,3 +1,5 @@
+// DEPRECATED: greytrace-backend is retired; do not use.
+
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({

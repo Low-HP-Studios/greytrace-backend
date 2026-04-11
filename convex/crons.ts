@@ -1,3 +1,5 @@
+// DEPRECATED: greytrace-backend is retired; do not use.
+
 import { cronJobs } from "convex/server";
 import { internal } from "./_generated/api";
 

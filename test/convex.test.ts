@@ -1,4 +1,6 @@
 /// <reference types="vite/client" />
+// DEPRECATED: greytrace-backend is retired; do not use.
+
 import { convexTest } from "convex-test";
 import { expect, test } from "vitest";
 import { api } from "../convex/_generated/api";

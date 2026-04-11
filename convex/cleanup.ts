@@ -1,3 +1,5 @@
+// DEPRECATED: greytrace-backend is retired; do not use.
+
 import { internalMutation } from "./_generated/server";
 
 export const runCleanup = internalMutation({
