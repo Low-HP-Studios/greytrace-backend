@@ -2,7 +2,7 @@
   "name": "greytrace-backend",
   "private": true,
   "version": "0.1.0",
-  "description": "Greytrace Convex backend (auth, lobbies, match)",
+  "description": "[DEPRECATED] Greytrace Convex backend — not maintained; do not use",
   "type": "module",
   "scripts": {
     "dev": "convex dev",
